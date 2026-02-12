@@ -4,5 +4,8 @@ vpn_cred.dat
 # Config (auto-generated with defaults)
 config.json
 
+# Build output (rebuild with build.bat)
+AutoVPN.exe
+
 # Old files
 vpn_cred.txt

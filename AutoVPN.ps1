@@ -157,7 +157,15 @@ public class ChildInfo {
 #endregion
 
 #region [2] Global Variables
-$Script:ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
+# Detect script directory (works for both .ps1 and PS2EXE .exe)
+if ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName -match '\.exe$' -and
+    -not ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName -match 'powershell\.exe$|pwsh\.exe$')) {
+    # Running as compiled .exe
+    $Script:ScriptDir = Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+} else {
+    # Running as .ps1 script
+    $Script:ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+}
 $Script:ConfigPath  = Join-Path $Script:ScriptDir "config.json"
 $Script:Config      = $null
 $Script:MainForm    = $null
@@ -1323,8 +1331,15 @@ function Main {
 # Ensure STA thread for Windows Forms
 if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     Write-Host "[WARN] Not in STA mode - restarting in STA..." -ForegroundColor Yellow
-    $scriptPath = $MyInvocation.MyCommand.Definition
-    Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$scriptPath`""
+    $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    if ($exePath -match 'powershell\.exe$|pwsh\.exe$') {
+        # Running as .ps1 - relaunch with -STA
+        $scriptPath = $MyInvocation.MyCommand.Definition
+        Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$scriptPath`""
+    } else {
+        # Running as .exe - relaunch self
+        Start-Process -FilePath $exePath
+    }
     exit
 }
 
