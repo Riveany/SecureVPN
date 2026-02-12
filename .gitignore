@@ -1,0 +1,8 @@
+# Credentials (DPAPI encrypted - user-specific)
+vpn_cred.dat
+
+# Config (auto-generated with defaults)
+config.json
+
+# Old files
+vpn_cred.txt
