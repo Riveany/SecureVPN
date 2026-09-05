@@ -35,6 +35,15 @@ public class Win32 {
     [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
+    // SendMessage blocks until the target's message loop finishes handling the
+    // message. If the click opens a modal dialog, that never happens until the
+    // dialog closes - which hangs this thread with no timeout. Use the timeout
+    // variants for anything that needs a return value, PostMessage for clicks.
+    [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, StringBuilder lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
     // Window state
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -52,6 +61,14 @@ public class Win32 {
     public const int  SW_SHOW       = 5;
     public const int  SW_RESTORE    = 9;
 
+    // SendMessageTimeout flags / defaults
+    public const uint SMTO_ABORTIFHUNG = 0x0002;
+    public const uint MSG_TIMEOUT_MS   = 3000;
+
+    // GetWindowLong index and Edit style bit used to identify a password field
+    public const int  GWL_STYLE     = -16;
+    public const int  ES_PASSWORD   = 0x0020;
+
     // SVPClient known dialog control IDs (Login window)
     public const int ID_LOGIN_BTN    = 1018;
     public const int ID_CLOSE_BTN    = 1109;
@@ -63,6 +80,22 @@ public class Win32 {
     // Systray Dialog control IDs (when connected)
     public const int ID_SYSTRAY_CANCEL_BTN = 1016;  // &Cancel = disconnect
     public const int ID_SYSTRAY_LOGIN_BTN  = 1018;  // &Login (disabled when connected)
+
+    // Security Alert dialog - verified by live enumeration against v6.3.0.
+    // Note this dialog does NOT use the standard IDYES = 6.
+    public const int ID_SECALERT_YES  = 1278;
+    public const int ID_SECALERT_NO   = 1279;
+    public const int ID_SECALERT_VIEW = 1079;
+
+    // "SSL VPN-Plus Client: User Authentication" dialog - verified by live
+    // enumeration. Previously these controls were located by position, which
+    // risked typing the password into the visible username box if the layout
+    // ever changed.
+    public const int ID_AUTH_USER   = 1012;
+    public const int ID_AUTH_PASS   = 1219;
+    public const int ID_AUTH_OK     = 1;
+    public const int ID_AUTH_CANCEL = 1109;
+    public const int ID_AUTH_REMEMBER_PASS = 1218;  // disabled + hidden by gateway policy
 
     /// <summary>Find a visible window by exact or partial title match</summary>
     public static IntPtr FindWindowByTitle(string titlePart) {
@@ -118,31 +151,57 @@ public class Win32 {
         return list;
     }
 
-    /// <summary>Click a button by sending BM_CLICK, with WM_COMMAND fallback</summary>
+    /// <summary>Click a control handle without blocking on a modal dialog</summary>
+    public static void ClickHandle(IntPtr btn) {
+        // PostMessage, not SendMessage: if this click opens a modal dialog the
+        // synchronous form would not return until that dialog is dismissed.
+        PostMessage(btn, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    /// <summary>Click a button by control ID. Returns false if not found.</summary>
     public static bool ClickButton(IntPtr parent, int controlId) {
         IntPtr btn = GetDlgItem(parent, controlId);
         if (btn == IntPtr.Zero) return false;
-
-        // Primary: BM_CLICK
-        SendMessage(btn, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+        ClickHandle(btn);
         return true;
+    }
+
+    /// <summary>Set text on a control handle. Bounded by a timeout.</summary>
+    public static bool SetTextHandle(IntPtr ctrl, string text) {
+        if (ctrl == IntPtr.Zero) return false;
+        IntPtr result;
+        IntPtr ok = SendMessageTimeout(ctrl, WM_SETTEXT, IntPtr.Zero, text,
+                                       SMTO_ABORTIFHUNG, MSG_TIMEOUT_MS, out result);
+        return ok != IntPtr.Zero;
     }
 
     /// <summary>Set text on a control via WM_SETTEXT</summary>
     public static bool SetText(IntPtr parent, int controlId, string text) {
-        IntPtr ctrl = GetDlgItem(parent, controlId);
-        if (ctrl == IntPtr.Zero) return false;
-        SendMessage(ctrl, WM_SETTEXT, IntPtr.Zero, text);
-        return true;
+        return SetTextHandle(GetDlgItem(parent, controlId), text);
     }
 
-    /// <summary>Get text from a control via WM_GETTEXT</summary>
+    /// <summary>Get text from a control via WM_GETTEXT. Bounded by a timeout.</summary>
     public static string GetText(IntPtr hwnd) {
-        int len = (int)SendMessage(hwnd, WM_GETTEXTLENGTH, IntPtr.Zero, IntPtr.Zero);
+        IntPtr result;
+        if (SendMessageTimeout(hwnd, WM_GETTEXTLENGTH, IntPtr.Zero, IntPtr.Zero,
+                               SMTO_ABORTIFHUNG, MSG_TIMEOUT_MS, out result) == IntPtr.Zero) {
+            return "";  // target hung or timed out
+        }
+        int len = (int)result;
         if (len <= 0) return "";
         StringBuilder sb = new StringBuilder(len + 1);
-        SendMessage(hwnd, WM_GETTEXT, (IntPtr)(len + 1), sb.ToString());
+        // NOTE: the buffer must be passed as StringBuilder, not sb.ToString(),
+        // or the receiving text is written into a throwaway copy.
+        if (SendMessageTimeout(hwnd, WM_GETTEXT, (IntPtr)(len + 1), sb,
+                               SMTO_ABORTIFHUNG, MSG_TIMEOUT_MS, out result) == IntPtr.Zero) {
+            return "";
+        }
         return sb.ToString();
+    }
+
+    /// <summary>True if this Edit control has the ES_PASSWORD style</summary>
+    public static bool IsPasswordField(IntPtr hwnd) {
+        return (GetWindowLong(hwnd, GWL_STYLE) & ES_PASSWORD) != 0;
     }
 }
 
@@ -375,7 +434,15 @@ function Handle-SecurityAlert {
         if ($hwnd -ne [IntPtr]::Zero) {
             Write-Log "Found Security Alert dialog (HWND: $($hwnd.ToInt64()))" "Yellow"
 
-            # Enumerate buttons to find "Yes" (typically IDYES = 6)
+            # Preferred: the verified control ID for this client's Yes button.
+            # This dialog does NOT use the standard IDYES = 6.
+            if ([Win32]::ClickButton($hwnd, [Win32]::ID_SECALERT_YES)) {
+                Write-Log "Clicked Yes (ID: $([Win32]::ID_SECALERT_YES)) on Security Alert" "Green"
+                Write-Log "Security Alert accepted" "Green"
+                return $true
+            }
+
+            # Fallback: locate the Yes button by text
             $children = [Win32]::GetChildren($hwnd)
             $yesBtn = $null
             foreach ($child in $children) {
@@ -391,7 +458,7 @@ function Handle-SecurityAlert {
 
             if ($yesBtn) {
                 Write-Log "Clicking Yes on Security Alert..." "Yellow"
-                [Win32]::SendMessage($yesBtn.Handle, [Win32]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+                [Win32]::ClickHandle($yesBtn.Handle)
                 Write-Log "Security Alert accepted" "Green"
                 return $true
             } else {
@@ -399,7 +466,7 @@ function Handle-SecurityAlert {
                 $yesBtnHwnd = [Win32]::GetDlgItem($hwnd, 6)
                 if ($yesBtnHwnd -ne [IntPtr]::Zero) {
                     Write-Log "Clicking Yes (ID=6) on Security Alert..." "Yellow"
-                    [Win32]::SendMessage($yesBtnHwnd, [Win32]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+                    [Win32]::ClickHandle($yesBtnHwnd)
                     Write-Log "Security Alert accepted" "Green"
                     return $true
                 }
@@ -478,24 +545,49 @@ function Fill-AuthForm {
         }
     }
 
-    if ($editControls.Count -lt 2) {
-        Write-Log "ERROR: Expected 2 Edit controls (user/pass), found $($editControls.Count)" "Red"
-        return $false
+    # Resolve the two fields. Preferred: verified control IDs. Fallback: the old
+    # positional guess, but only after confirming the ES_PASSWORD style is where
+    # it is expected - otherwise the password would be typed into a visible box.
+    $userHwnd = [Win32]::GetDlgItem($AuthWindowHwnd, [Win32]::ID_AUTH_USER)
+    $passHwnd = [Win32]::GetDlgItem($AuthWindowHwnd, [Win32]::ID_AUTH_PASS)
+
+    if ($userHwnd -ne [IntPtr]::Zero -and $passHwnd -ne [IntPtr]::Zero -and [Win32]::IsPasswordField($passHwnd)) {
+        Write-Log "Using verified control IDs (user=$([Win32]::ID_AUTH_USER), pass=$([Win32]::ID_AUTH_PASS))" "Cyan"
+    } else {
+        Write-Log "Verified control IDs not found - falling back to positional mapping" "Yellow"
+
+        if ($editControls.Count -lt 2) {
+            Write-Log "ERROR: Expected 2 Edit controls (user/pass), found $($editControls.Count)" "Red"
+            return $false
+        }
+
+        $userHwnd = $editControls[0].Handle
+        $passHwnd = $editControls[1].Handle
+
+        # Refuse to type the password into a field that does not mask input.
+        if (-not [Win32]::IsPasswordField($passHwnd)) {
+            Write-Log "ERROR: Second Edit control is not a password field - aborting to avoid exposing the password" "Red"
+            return $false
+        }
     }
 
-    # First Edit = Username, Second Edit = Password
-    $userCtrl = $editControls[0]
-    $passCtrl = $editControls[1]
-
     Write-Log "Setting username..." "Yellow"
-    [Win32]::SendMessage($userCtrl.Handle, [Win32]::WM_SETTEXT, [IntPtr]::Zero, $Username) | Out-Null
+    [Win32]::SetTextHandle($userHwnd, $Username) | Out-Null
     Start-Sleep -Milliseconds 200
 
     Write-Log "Setting password..." "Yellow"
-    [Win32]::SendMessage($passCtrl.Handle, [Win32]::WM_SETTEXT, [IntPtr]::Zero, $Password) | Out-Null
+    [Win32]::SetTextHandle($passHwnd, $Password) | Out-Null
     Start-Sleep -Milliseconds 200
 
-    # Find OK button
+    # Find OK button - prefer the verified control ID
+    $okHwnd = [Win32]::GetDlgItem($AuthWindowHwnd, [Win32]::ID_AUTH_OK)
+    if ($okHwnd -ne [IntPtr]::Zero) {
+        Write-Log "Clicking OK button (ID: $([Win32]::ID_AUTH_OK))..." "Yellow"
+        [Win32]::ClickHandle($okHwnd)
+        Write-Log "Authentication submitted!" "Green"
+        return $true
+    }
+
     $okBtn = $buttonControls | Where-Object { $_.Text -match "OK|Login|Submit|Connect" -or $_.ControlId -eq 1 } | Select-Object -First 1
     if (-not $okBtn) {
         # Fallback: first enabled button
@@ -504,7 +596,7 @@ function Fill-AuthForm {
 
     if ($okBtn) {
         Write-Log "Clicking OK button (ID: $($okBtn.ControlId), Text: '$($okBtn.Text)')..." "Yellow"
-        [Win32]::SendMessage($okBtn.Handle, [Win32]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        [Win32]::ClickHandle($okBtn.Handle)
         Write-Log "Authentication submitted!" "Green"
         return $true
     }
@@ -586,7 +678,7 @@ function Dismiss-SVPNotification {
             }
             if ($okBtn -ne [IntPtr]::Zero) {
                 Write-Log "Dismissing SVPClient notification..." "Yellow"
-                [Win32]::SendMessage($okBtn, [Win32]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+                [Win32]::ClickHandle($okBtn)
                 Write-Log "Notification dismissed" "Green"
                 return
             }
