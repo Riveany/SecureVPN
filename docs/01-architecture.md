@@ -38,11 +38,11 @@ This is the most important section in this document.
 
 The application has **one thread**. `Main` ends with
 `[System.Windows.Forms.Application]::Run($form)` at
-[AutoVPN.ps1:1420](../AutoVPN.ps1), which starts the Windows Forms message
+[AutoVPN.ps1:1573](../AutoVPN.ps1), which starts the Windows Forms message
 loop on that thread.
 
 When you click **Connect VPN**, the button's click handler calls `Connect-VPN`
-([AutoVPN.ps1:699](../AutoVPN.ps1)). That function does not return for as long
+([AutoVPN.ps1:775](../AutoVPN.ps1)). That function does not return for as long
 as the connection sequence takes — potentially 60 seconds or more. Because it
 is running on the UI thread, the message loop is blocked for that whole time,
 and the window would freeze.
@@ -52,7 +52,7 @@ mechanisms do this:
 
 1. Direct calls to `[System.Windows.Forms.Application]::DoEvents()` between
    steps of `Connect-VPN`.
-2. `DoEvents-Sleep` ([AutoVPN.ps1:690](../AutoVPN.ps1)), a replacement for
+2. `DoEvents-Sleep` ([AutoVPN.ps1:723](../AutoVPN.ps1)), a replacement for
    `Start-Sleep` that alternates `DoEvents()` with 100 ms sleeps:
 
    ```powershell
@@ -70,7 +70,7 @@ mechanisms do this:
 in the automation engine.
 
 `Update-UIState` also ends with a `DoEvents()` call
-([AutoVPN.ps1:959](../AutoVPN.ps1)), so every status change is a pump point too.
+([AutoVPN.ps1:1100](../AutoVPN.ps1)), so every status change is a pump point too.
 
 `DoEvents()` processes all pending Windows messages, which includes **user
 input events**. So while `Connect-VPN` is waiting for the authentication window
@@ -96,7 +96,7 @@ All mutable state is `$Script:`-scoped, declared in region 2:
 
 `$Script:IsConnecting` is the only explicit concurrency control in the program.
 It prevents a second `Connect-VPN` from starting while one is in progress
-([AutoVPN.ps1:700](../AutoVPN.ps1)), and is cleared in a `finally` block.
+([AutoVPN.ps1:777](../AutoVPN.ps1)), and is cleared in a `finally` block.
 
 Button enablement provides a second layer: `Update-UIState "Connecting"` disables
 both Connect and Disconnect. Neither mechanism reaches the tray-menu items or the
@@ -126,7 +126,7 @@ and fail to find `config.json`.
 
 Windows Forms requires a single-threaded apartment. The entry point checks the
 current thread's apartment state and, if it is not STA, relaunches itself with
-the correct flag and exits ([AutoVPN.ps1:1424](../AutoVPN.ps1)). The relaunch
+the correct flag and exits ([AutoVPN.ps1:1577](../AutoVPN.ps1)). The relaunch
 path differs for script and executable, mirroring the directory detection above.
 
 This is why [`app.bat`](../app.bat) passes `-STA` explicitly — it avoids the

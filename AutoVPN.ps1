@@ -235,6 +235,29 @@ $Script:ConnectBtn  = $null
 $Script:DisconnectBtn = $null
 $Script:TrayIcon    = $null
 $Script:IsConnecting = $false
+
+# Controls that are NOT part of the form's Controls collection, or that
+# Update-UIState would otherwise be unable to reach. The connect sequence pumps
+# the message loop while it waits, so every enabled entry point can run nested
+# inside it - these have to be disabled for the duration alongside the two main
+# buttons. See docs/04-background-service.md.
+$Script:SettingsBtn    = $null
+$Script:TrayConnect    = $null
+$Script:TrayDisconnect = $null
+$Script:TraySettings   = $null
+
+# Set when the user asks to cancel an in-flight connect. Every polling loop in
+# the automation engine checks it, so a cancel takes effect at the next poll
+# rather than at the end of the current step's timeout.
+$Script:CancelRequested = $false
+
+# Guards Disconnect-VPN the way $Script:IsConnecting guards Connect-VPN.
+$Script:IsDisconnecting = $false
+
+# Set when a disconnect was requested during a connect. Connect-VPN's finally
+# block performs the disconnect once its own stack has unwound, which avoids
+# the deadlock of waiting for it from inside its own message pump.
+$Script:DisconnectAfterCancel = $false
 #endregion
 
 #region [3] Config Management
@@ -384,6 +407,8 @@ function Find-SVPLoginWindow {
 
     $elapsed = 0
     while ($elapsed -lt $TimeoutSeconds) {
+        if (Test-Cancelled) { return @{ Status = "cancelled"; Handle = [IntPtr]::Zero } }
+
         $hwnd = [Win32]::FindWindowByTitle("SSL VPN-Plus Client - Login")
         if ($hwnd -ne [IntPtr]::Zero) {
             Write-Log "Found Login window (HWND: $($hwnd.ToInt64()))" "Green"
@@ -430,6 +455,8 @@ function Handle-SecurityAlert {
     Write-Log "Checking for Security Alert dialog..." "Yellow"
     $elapsed = 0
     while ($elapsed -lt $TimeoutSeconds) {
+        if (Test-Cancelled) { return $false }
+
         $hwnd = [Win32]::FindWindowByTitle("Security Alert")
         if ($hwnd -ne [IntPtr]::Zero) {
             Write-Log "Found Security Alert dialog (HWND: $($hwnd.ToInt64()))" "Yellow"
@@ -495,10 +522,12 @@ function Find-AuthWindow {
     Write-Log "Waiting for Authentication window..." "Yellow"
     $elapsed = 0
     while ($elapsed -lt $TimeoutSeconds) {
+        if (Test-Cancelled) { return [IntPtr]::Zero }
+
         # Also handle Security Alert if it pops up during wait
         $secHwnd = [Win32]::FindWindowByTitle("Security Alert")
         if ($secHwnd -ne [IntPtr]::Zero) {
-            Handle-SecurityAlert -TimeoutSeconds 5
+            Handle-SecurityAlert -TimeoutSeconds 5 | Out-Null
             DoEvents-Sleep 1000
             continue
         }
@@ -638,6 +667,8 @@ function Test-VpnConnected {
     Write-Log "Verifying VPN connection..." "Yellow"
     $elapsed = 0
     while ($elapsed -lt $TimeoutSeconds) {
+        if (Test-Cancelled) { return $false }
+
         if (Test-VpnConnectedNow) {
             Write-Log "VPN Connected! (adapter verified)" "Green"
             return $true
@@ -669,6 +700,8 @@ function Dismiss-SVPNotification {
     # This is a small #32770 dialog from SVPClient with title "SSL VPN-Plus Client" and OK button
     $maxAttempts = 5
     for ($i = 0; $i -lt $maxAttempts; $i++) {
+        if ($Script:CancelRequested) { return }
+
         $hwnd = [Win32]::FindWindowByTitle("SSL VPN-Plus Client")
         if ($hwnd -ne [IntPtr]::Zero) {
             # Check if this is the notification dialog (has OK button with ID=1 or ID=2)
@@ -692,7 +725,50 @@ function DoEvents-Sleep {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($sw.ElapsedMilliseconds -lt $Milliseconds) {
         [System.Windows.Forms.Application]::DoEvents()
+        # Stop waiting the moment a cancel arrives, so the caller's next
+        # Test-Cancelled check fires without burning the rest of this sleep.
+        if ($Script:CancelRequested) { return }
         Start-Sleep -Milliseconds 100
+    }
+}
+
+<#
+.SYNOPSIS
+    True if the user has asked to cancel the running connect sequence.
+.DESCRIPTION
+    Called at the top of every polling loop in the automation engine. Logs once
+    per check so the activity log shows where the sequence stopped.
+#>
+function Test-Cancelled {
+    if ($Script:CancelRequested) {
+        Write-Log "Cancel requested - stopping connect sequence" "Yellow"
+        return $true
+    }
+    return $false
+}
+
+<#
+.SYNOPSIS
+    Enable or disable every control that can start or stop VPN work.
+.DESCRIPTION
+    The form's Connect and Disconnect buttons are handled by Update-UIState.
+    The tray menu items and the Settings button are not part of that path -
+    ContextMenuStrip items carry their own Enabled property - so they are set
+    here. AllowDisconnect stays true during a connect so the user can cancel.
+#>
+function Set-ActionsEnabled {
+    param(
+        [bool]$Enabled,
+        [bool]$AllowDisconnect = $false
+    )
+
+    try {
+        if ($Script:SettingsBtn)    { $Script:SettingsBtn.Enabled    = $Enabled }
+        if ($Script:TraySettings)   { $Script:TraySettings.Enabled   = $Enabled }
+        if ($Script:TrayConnect)    { $Script:TrayConnect.Enabled    = $Enabled }
+        if ($Script:TrayDisconnect) { $Script:TrayDisconnect.Enabled = ($Enabled -or $AllowDisconnect) }
+    } catch {
+        # Controls not built yet - ignore
     }
 }
 
@@ -701,9 +777,16 @@ function Connect-VPN {
         Write-Log "Connection already in progress..." "Yellow"
         return
     }
+    if ($Script:IsDisconnecting) {
+        Write-Log "Disconnect in progress - please wait" "Yellow"
+        return
+    }
 
     $Script:IsConnecting = $true
+    $Script:CancelRequested = $false
     Update-UIState "Connecting"
+    # Leave Disconnect reachable so the user can cancel; block everything else.
+    Set-ActionsEnabled -Enabled $false -AllowDisconnect $true
 
     try {
         # Load credentials
@@ -732,11 +815,14 @@ function Connect-VPN {
             Update-UIState "Connected"
             return
         }
+        if ($loginResult.Status -eq "cancelled") { return }
         if ($loginResult.Status -eq "timeout") {
             Update-UIState "Error"
             return
         }
         $loginHwnd = $loginResult.Handle
+
+        if (Test-Cancelled) { return }
 
         # Step 3: Click Login button
         Write-Log "Step 3: Clicking Login..." "Yellow"
@@ -751,14 +837,18 @@ function Connect-VPN {
         # Step 4: Handle Security Alert (certificate dialog)
         Write-Log "Step 4: Checking for Security Alert..." "Yellow"
         [System.Windows.Forms.Application]::DoEvents()
-        Handle-SecurityAlert -TimeoutSeconds 10
+        Handle-SecurityAlert -TimeoutSeconds 10 | Out-Null
 
         DoEvents-Sleep 1000
+
+        if (Test-Cancelled) { return }
 
         # Step 5: Find Auth window
         Write-Log "Step 5: Waiting for Authentication..." "Yellow"
         [System.Windows.Forms.Application]::DoEvents()
         $authHwnd = Find-AuthWindow -TimeoutSeconds 20
+
+        if ($Script:CancelRequested) { return }
 
         if ($authHwnd -eq [IntPtr]::Zero) {
             # Check if VPN connected anyway
@@ -782,6 +872,8 @@ function Connect-VPN {
             }
             return
         }
+
+        if (Test-Cancelled) { return }
 
         # Step 6: Fill auth form
         Write-Log "Step 6: Filling credentials..." "Yellow"
@@ -827,10 +919,52 @@ function Connect-VPN {
         Update-UIState "Error"
     } finally {
         $Script:IsConnecting = $false
+
+        if ($Script:CancelRequested) {
+            # The sequence was abandoned partway through. Report the real
+            # adapter state rather than assuming either outcome.
+            Write-Log "Connect sequence cancelled" "Yellow"
+            if (Test-VpnConnectedNow) { Update-UIState "Connected" }
+            else                      { Update-UIState "Disconnected" }
+        }
+
+        Set-ActionsEnabled -Enabled $true
+
+        # A disconnect requested mid-connect deferred itself to here, where the
+        # connect sequence is off the stack and the two cannot overlap.
+        if ($Script:DisconnectAfterCancel) {
+            $Script:DisconnectAfterCancel = $false
+            $Script:CancelRequested = $false
+            Write-Log "Proceeding with requested disconnect..." "Yellow"
+            Disconnect-VPN
+        }
     }
 }
 
 function Disconnect-VPN {
+    if ($Script:IsDisconnecting) {
+        Write-Log "Disconnect already in progress..." "Yellow"
+        return
+    }
+
+    # Asked to disconnect while a connect is running.
+    #
+    # This handler is reached from inside the connect sequence's own message
+    # pump, so Connect-VPN is still on the stack below us. Waiting here for it
+    # to finish would deadlock: it cannot return until we do. Instead, record
+    # the request and return. Connect-VPN sees the cancel at its next check,
+    # unwinds, and its finally block calls back here on a clean stack.
+    if ($Script:IsConnecting) {
+        Write-Log "Cancelling connect in progress..." "Yellow"
+        $Script:CancelRequested = $true
+        $Script:DisconnectAfterCancel = $true
+        return
+    }
+
+    $Script:IsDisconnecting = $true
+    Set-ActionsEnabled -Enabled $false
+
+    try {
     Write-Log "Disconnecting VPN..." "Yellow"
     Update-UIState "Disconnecting"
 
@@ -905,6 +1039,13 @@ function Disconnect-VPN {
         Write-Log "VPN Disconnected!" "Green"
         Update-UIState "Disconnected"
     }
+
+    } finally {
+        $Script:IsDisconnecting = $false
+        $Script:CancelRequested = $false
+        $Script:DisconnectAfterCancel = $false
+        Set-ActionsEnabled -Enabled $true
+    }
 }
 #endregion
 
@@ -965,6 +1106,14 @@ function Update-UIState {
 
 #region [8] Settings Dialog
 function Show-SettingsDialog {
+    # This dialog is modal. Opened from inside a running sequence - which the
+    # message pump makes possible - it would hold that sequence frozen mid-step
+    # while its timeouts kept running against the wall clock.
+    if ($Script:IsConnecting -or $Script:IsDisconnecting) {
+        Write-Log "Settings unavailable while a VPN operation is running" "Yellow"
+        return
+    }
+
     $settingsForm = New-Object System.Windows.Forms.Form
     $settingsForm.Text = "AutoVPN Settings"
     $settingsForm.Size = New-Object System.Drawing.Size(420, 380)
@@ -1272,6 +1421,7 @@ function Build-MainForm {
 
     # Settings button
     $settingsBtn = New-Object System.Windows.Forms.Button
+    $Script:SettingsBtn = $settingsBtn
     $settingsBtn.Text = "Settings"
     $settingsBtn.Location = New-Object System.Drawing.Point(15, 215)
     $settingsBtn.Size = New-Object System.Drawing.Size(355, 30)
@@ -1316,17 +1466,20 @@ function Build-MainForm {
 
     $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
     $trayConnect = $trayMenu.Items.Add("Connect VPN")
+    $Script:TrayConnect = $trayConnect
     $trayConnect.Add_Click({
         $Script:MainForm.Show()
         $Script:MainForm.WindowState = "Normal"
         Connect-VPN
     })
     $trayDisconnect = $trayMenu.Items.Add("Disconnect")
+    $Script:TrayDisconnect = $trayDisconnect
     $trayDisconnect.Add_Click({
         Disconnect-VPN
     })
     $trayMenu.Items.Add("-") | Out-Null
     $traySettings = $trayMenu.Items.Add("Settings")
+    $Script:TraySettings = $traySettings
     $traySettings.Add_Click({
         $Script:MainForm.Show()
         $Script:MainForm.WindowState = "Normal"

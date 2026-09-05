@@ -32,7 +32,7 @@ This is the primary one.
 `Connect-VPN` runs on the same thread as the Windows Forms message loop. To keep
 the window responsive during its long waits, it repeatedly calls
 `[System.Windows.Forms.Application]::DoEvents()` — directly between steps, and
-inside `DoEvents-Sleep` ([AutoVPN.ps1:690](../AutoVPN.ps1)), which is invoked
+inside `DoEvents-Sleep` ([AutoVPN.ps1:723](../AutoVPN.ps1)), which is invoked
 from 23 places including every polling loop.
 
 `DoEvents()` dispatches all pending Windows messages. That includes user input.
@@ -50,66 +50,83 @@ authentication window belonging to a process that no longer exists — until its
 UI state that `Disconnect-VPN` just set.
 
 `Update-UIState` itself ends with a `DoEvents()` call
-([AutoVPN.ps1:959](../AutoVPN.ps1)), so even a routine status update inside the
+([AutoVPN.ps1:1100](../AutoVPN.ps1)), so even a routine status update inside the
 sequence is a re-entrancy point.
 
-## Cause 2 — the guards cover the buttons but not the tray
+## Cause 2 — the guards cover the buttons but not the tray (FIXED)
 
-The main window's Connect and Disconnect buttons are, in fact, already protected.
-`Update-UIState "Connecting"` disables both ([AutoVPN.ps1:936](../AutoVPN.ps1)),
-and `Connect-VPN` sets that state before doing any work. A double-click on
-Connect is additionally blocked by `$Script:IsConnecting`
-([AutoVPN.ps1:700](../AutoVPN.ps1)).
+> Resolved. Recorded here because it explains the reported symptom and the
+> shape of the fix.
 
-Three entry points are **not** covered:
+The main window's Connect and Disconnect buttons were already protected:
+`Update-UIState "Connecting"` disables both, and `$Script:IsConnecting` blocked a
+second `Connect-VPN`.
 
-| Entry point | Location | Guard |
+Three entry points were not covered, because `ContextMenuStrip` items carry
+their own `Enabled` property and were never touched by `Update-UIState`:
+
+| Entry point | Was | Now |
 |---|---|---|
-| Tray menu → Connect VPN | [AutoVPN.ps1:1320](../AutoVPN.ps1) | `$Script:IsConnecting` only — logs and returns |
-| Tray menu → Disconnect | [AutoVPN.ps1:1326](../AutoVPN.ps1) | **none** — runs the full disconnect mid-connect |
-| Settings button / tray → Settings | [AutoVPN.ps1:1280](../AutoVPN.ps1), [1240](../AutoVPN.ps1) | **none** — the button is never disabled, and the dialog is modal |
+| Tray → Connect VPN | `$Script:IsConnecting` only | Disabled for the whole sequence |
+| Tray → Disconnect | **unguarded** — killed the client mid-connect | Cancels the connect, then disconnects |
+| Settings button / tray → Settings | **unguarded**, and modal | Disabled; `Show-SettingsDialog` also refuses to open |
 
-`ContextMenuStrip` items have their own `Enabled` property and are never touched
-by `Update-UIState`, so disabling the form's buttons does nothing for them.
+`Set-ActionsEnabled` now gates all four controls, and `Show-SettingsDialog`
+returns early if a sequence is running, so the modal can no longer freeze a
+connect mid-step.
 
-The tray Disconnect item is the damaging one: `Disconnect-VPN`
-([AutoVPN.ps1:833](../AutoVPN.ps1)) has no re-entrancy guard of any kind, and it
-kills the process the in-flight connect sequence is still driving.
+### Cancellation
 
-The Settings path is subtler. `Show-SettingsDialog` is modal, so the nested call
-does not return until the dialog is dismissed — the connect sequence is frozen
-mid-step for as long as the dialog is open, while its timeouts continue to be
-measured against the wall clock in the polling loops that use
-`[System.Diagnostics.Stopwatch]`.
+`$Script:CancelRequested` is checked by `Test-Cancelled` at the top of every
+polling loop and between connect steps, and `DoEvents-Sleep` returns early when
+it is set. A cancel therefore takes effect at the next poll — measured at
+**0.1 s** — rather than after the current step's timeout, which for step 5 was
+up to 20 seconds.
+
+### The deadlock this created, and why the fix is shaped as it is
+
+The first implementation had `Disconnect-VPN` set the cancel flag and then wait
+for `$Script:IsConnecting` to clear. That deadlocks, and testing caught it.
+
+The tray handler runs *inside the connect sequence's own message pump*, so
+`Connect-VPN` is still on the stack below it. `Connect-VPN` can only clear the
+flag by returning, and it cannot return until the handler does. The wait expired
+after 10 seconds and the disconnect was silently discarded — worse than the
+original bug.
+
+The working shape: `Disconnect-VPN` sets `$Script:CancelRequested` and
+`$Script:DisconnectAfterCancel`, then **returns immediately**. `Connect-VPN`
+sees the cancel, unwinds, and its `finally` block invokes the disconnect on a
+clean stack. The two sequences can never be on the stack at once.
+
+Verified live: cancel at step 4 unwound in 0.1 s, the disconnect then ran to
+completion, and both flags were clear afterwards.
 
 ## Options for background operation
 
-### Option A — move the sequence to a background runspace
+### Option A — move the sequence to a background runspace (NOT DONE)
 
 Run the connect and disconnect sequences on a separate PowerShell runspace and
-marshal only status updates back to the UI thread via `Control.Invoke`.
+marshal status updates back to the UI thread via `Control.Invoke`.
 
-This eliminates cause 1 outright. The UI thread returns to its normal message
-loop immediately after the button click, so it stays responsive without any
-`DoEvents()` calls, and no user input can re-enter the sequence. `DoEvents-Sleep`
-becomes a plain `Start-Sleep` on the worker thread.
+**This has not been implemented, and is no longer the first thing to reach for.**
+The guard-and-cancel work above closes the re-entrancy that caused the reported
+symptom, and the `SendMessageTimeout`/`PostMessage` change removed the only way a
+single Win32 call could block the thread. What remains on the UI thread is
+`Start-Sleep` in 100 ms slices between `DoEvents()` calls.
 
-What it requires:
+It would still be required to run the connect flow with no window at all, and it
+is a prerequisite for any headless mode. If it is done later it needs:
 
-- A runspace with the `Win32` type and the automation functions available to it.
-- Replacing `Write-Log` and `Update-UIState` with thread-safe versions that
-  marshal to the UI thread — every touch of `$Script:LogBox`, `$Script:StatusLabel`,
-  and the buttons must go through `Invoke`, because Windows Forms controls may
-  only be touched from the thread that created them.
-- A cancellation mechanism, so that a Disconnect request during a connection
-  stops the worker rather than racing it.
-- Deciding what the Disconnect button does mid-connect: cancel the worker and
-  then disconnect, or refuse until the worker finishes.
+- a runspace with the `Win32` type and the automation functions available;
+- thread-safe `Write-Log` and `Update-UIState` that marshal every control touch
+  through `Invoke`, since Windows Forms controls may only be touched from the
+  thread that created them;
+- the same cancellation plumbing that already exists — `$Script:CancelRequested`
+  and the deferred-disconnect handoff carry over unchanged.
 
 Note that the UAC elevation in `Disconnect-VPN` behaves the same on a worker
-thread — the prompt is raised by the OS against the process, not the thread.
-
-This is the option that addresses the reported problem.
+thread: the prompt is raised by the OS against the process, not the thread.
 
 ### Option B — a Windows service running as SYSTEM
 
@@ -140,7 +157,7 @@ window suppressed or started directly to the tray.
 
 This runs in the interactive session, so window automation works. It removes the
 visible window that invites the stray click, and it replaces the Startup-folder
-shortcut created by `Set-AutoStart` ([AutoVPN.ps1:1151](../AutoVPN.ps1)) with
+shortcut created by `Set-AutoStart` ([AutoVPN.ps1:1300](../AutoVPN.ps1)) with
 something more controllable.
 
 It is a mitigation, not a fix. The re-entrancy in cause 1 is still present; there
@@ -182,44 +199,60 @@ setup, which suggests certificate auth is not configured here.
 
 ### Recommendation
 
-Option A is the fix. Option C is a worthwhile addition on top of it. Options B
-and D are both ruled out and are recorded here so they are not re-investigated:
-B is blocked by session 0 isolation, D by gateway policy.
+The reported symptom is fixed by the guard-and-cancel work described under
+Cause 2, not by any of these options.
 
-## Smaller changes worth making regardless
+Option C remains a worthwhile addition — it removes the window that invites the
+stray click in the first place. Option A is only needed for a genuinely headless
+mode. Options B and D are ruled out and recorded so they are not
+re-investigated: B is blocked by session 0 isolation, D by gateway policy.
 
-These are independent of which option is chosen:
+## Smaller changes
 
-- **Disable the tray menu items during a sequence.** This is the largest gap and
-  the cheapest to close. `Update-UIState` already owns enablement for the form's
-  buttons; extending it to hold references to `$trayConnect`, `$trayDisconnect`,
-  and `$traySettings` and set their `Enabled` alongside would remove the
-  most damaging re-entrancy path before any threading work is done.
-- **Disable the Settings button** in the `Connecting` and `Disconnecting` states,
-  for the same reason. It is currently a local variable in `Build-MainForm`
-  ([AutoVPN.ps1:1272](../AutoVPN.ps1)) and would need to be promoted to
-  `$Script:` scope to be reachable from `Update-UIState`.
-- **Add a re-entrancy guard to `Disconnect-VPN`** mirroring
-  `$Script:IsConnecting`, so it is defended even if a new entry point is added
-  later.
+Done:
+
+- **Tray menu items and the Settings button are gated** by `Set-ActionsEnabled`
+  during any sequence, and `Show-SettingsDialog` refuses to open on top of one.
+- **`Disconnect-VPN` has a re-entrancy guard** (`$Script:IsDisconnecting`) and
+  defers to `Connect-VPN`'s unwind rather than racing it.
+- **`SendMessage` replaced** by `PostMessage` for clicks and
+  `SendMessageTimeout` for text — see
+  [03-win32-reference.md](03-win32-reference.md).
+- **Verified control IDs 1012 and 1219** used in `Fill-AuthForm`, with an
+  `ES_PASSWORD` check that aborts rather than typing the password into a
+  visible field.
+
+Still open:
+
 - **Drop the `ShowWindow(SW_RESTORE)` in `Click-LoginButton`** (cause 3).
-  `BM_CLICK` does not need it. Verify against the client before removing.
-- **Replace `SendMessage` with `PostMessage` for clicks and
-  `SendMessageTimeout` for text reads.** `SendMessage` does not return while the
-  target is showing a modal dialog; on the UI thread that freezes the whole
-  application with no timeout. This was reproduced against the Settings button —
-  see [03-win32-reference.md](03-win32-reference.md).
-- **Use the verified control IDs 1012 and 1219** in `Fill-AuthForm` instead of
-  mapping the two `Edit` controls by position.
+  `BM_CLICK` does not need it, and it pulls the client's window forward for no
+  benefit. Verify against the client before removing.
 
 ## Verifying a fix
 
-To confirm the interference is gone, reproduce it deliberately first: start a
-connection and click Disconnect during step 5, when the log shows
-`Waiting for Authentication window...`. On the current code the log will show
-the disconnect completing, then step 5 continuing to poll and eventually timing
-out, with the final UI state coming from the connect sequence rather than the
-disconnect.
+The original failure is reproduced by starting a connection and selecting
+**Disconnect from the tray menu** during step 5, while the log shows
+`Waiting for Authentication window...`.
 
-After a fix, the same action should produce exactly one coherent outcome and one
-final UI state.
+Before the fix, the log showed the disconnect completing, then step 5 continuing
+to poll a process that no longer existed, timing out after 20 seconds, and
+overwriting the UI state the disconnect had just set.
+
+After the fix the same action produces one coherent outcome:
+
+```
+[..] Step 4: Checking for Security Alert...
+[..] Cancelling connect in progress...
+[..] Cancel requested - stopping connect sequence
+[..] Connect sequence cancelled
+[..] Proceeding with requested disconnect...
+[..] Disconnecting VPN...
+```
+
+`Connect-VPN` returns 0.1 s after the cancel, and both `$Script:IsConnecting`
+and `$Script:IsDisconnecting` are false afterwards.
+
+The intermediate deadlock is worth re-testing if this code is changed: if
+`Disconnect-VPN` ever waits for `$Script:IsConnecting` to clear instead of
+deferring, the log will show `Connect sequence did not stop in time` and the
+user's request will be discarded.
