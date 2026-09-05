@@ -25,33 +25,31 @@ reach their target regardless of which window has focus.
 The real cause is the threading model, and there are three distinct
 contributors.
 
-## Cause 1 — the sequence runs on the UI thread and pumps the message loop
+## Cause 1 — the sequence ran on the UI thread and pumped the message loop (FIXED)
 
-This is the primary one.
+This was the primary cause, and it is the one the runspace work removed.
 
-`Connect-VPN` runs on the same thread as the Windows Forms message loop. To keep
-the window responsive during its long waits, it repeatedly calls
-`[System.Windows.Forms.Application]::DoEvents()` — directly between steps, and
-inside `DoEvents-Sleep` ([AutoVPN.ps1:729](../AutoVPN.ps1)), which is invoked
-from 23 places including every polling loop.
+`Connect-VPN` used to run on the same thread as the Windows Forms message loop.
+To keep the window from freezing during its long waits it called
+`[System.Windows.Forms.Application]::DoEvents()` — between steps, inside
+`DoEvents-Sleep`, and at the end of `Update-UIState`.
 
-`DoEvents()` dispatches all pending Windows messages. That includes user input.
-So a click on any AutoVPN control while the connect sequence is waiting causes
-that control's event handler to run **nested inside** the paused `Connect-VPN`
-call — a re-entrant call on the same stack.
+`DoEvents()` dispatches all pending Windows messages, **including user input**.
+So a click on any enabled control while the sequence was waiting ran that
+control's handler *nested inside* the paused `Connect-VPN` call — a re-entrant
+call on the same stack.
 
-Concretely: while step 5 is polling for the authentication window, a click on a
-tray-menu item enters that item's handler on the same stack. Selecting
-**Disconnect** from the tray runs `Disconnect-VPN`, which kills `SVPClient.exe`,
-waits for the adapter to drop, sets the UI to `Disconnected`, and returns.
-Control then resumes inside step 5, which continues polling for an
-authentication window belonging to a process that no longer exists — until its
-20-second timeout elapses, at which point it reports an error and overwrites the
-UI state that `Disconnect-VPN` just set.
+Concretely: while step 5 polled for the authentication window, selecting
+Disconnect from the tray ran `Disconnect-VPN` on that same stack. It killed
+`SVPClient.exe`, waited for the adapter to drop, set the UI to `Disconnected`,
+and returned — whereupon step 5 resumed, kept polling for a window belonging to
+a process that no longer existed, timed out 20 seconds later, and overwrote the
+state the disconnect had just set.
 
-`Update-UIState` itself ends with a `DoEvents()` call
-([AutoVPN.ps1:1106](../AutoVPN.ps1)), so even a routine status update inside the
-sequence is a re-entrancy point.
+**Fixed** by moving the sequence to a worker thread (Option A below). The UI
+thread is no longer inside the sequence, so it has nothing to pump: there are now
+zero `DoEvents()` calls in the file. `DoEvents-Sleep` keeps its name but is now a
+plain sleep that returns early on cancel.
 
 ## Cause 2 — the guards cover the buttons but not the tray (FIXED)
 
@@ -122,29 +120,61 @@ The automation now never restores, raises, or focuses an SVPClient window.
 
 ## Options for background operation
 
-### Option A — move the sequence to a background runspace (NOT DONE)
+### Option A — move the sequence to a background runspace (DONE)
 
-Run the connect and disconnect sequences on a separate PowerShell runspace and
-marshal status updates back to the UI thread via `Control.Invoke`.
+The connect and disconnect sequences run on a worker thread. The UI thread
+returns to its normal message loop immediately after the button click and is
+never blocked, so nothing needs `DoEvents()` — there are now **zero** calls to
+it anywhere in the file, which removes the mechanism behind cause 1 entirely.
 
-**This has not been implemented, and is no longer the first thing to reach for.**
-The guard-and-cancel work above closes the re-entrancy that caused the reported
-symptom, and the `SendMessageTimeout`/`PostMessage` change removed the only way a
-single Win32 call could block the thread. What remains on the UI thread is
-`Start-Sleep` in 100 ms slices between `DoEvents()` calls.
+**Shape of the implementation**
 
-It would still be required to run the connect flow with no window at all, and it
-is a prerequisite for any headless mode. If it is done later it needs:
+`Connect-VPN` and `Disconnect-VPN` are thin dispatchers. The work itself lives in
+`Connect-VPNCore` and `Disconnect-VPNCore`, which are thread-agnostic.
+`Start-VpnWorker` runs one of them on a shared runspace and starts a UI-thread
+timer that reaps the worker when it finishes, surfacing any error into the log
+rather than losing it on a thread nobody is watching.
 
-- a runspace with the `Win32` type and the automation functions available;
-- thread-safe `Write-Log` and `Update-UIState` that marshal every control touch
-  through `Invoke`, since Windows Forms controls may only be touched from the
-  thread that created them;
-- the same cancellation plumbing that already exists — `$Script:CancelRequested`
-  and the deferred-disconnect handoff carry over unchanged.
+**Two things had to be verified rather than assumed**
 
-Note that the UAC elevation in `Disconnect-VPN` behaves the same on a worker
-thread: the prompt is raised by the OS against the process, not the thread.
+*A new runspace does not inherit this script's functions.* Calling one from the
+worker fails with "not recognized as the name of a cmdlet". So `Main` bootstraps
+the runspace by feeding it every relevant function definition from
+`Get-ChildItem Function:` before any work is dispatched.
+
+*A separate runspace does not share `$Script:` variables either.* The
+cancellation flags therefore live in `$Script:Shared`, a
+`[hashtable]::Synchronized(@{...})` handed to the worker as the same object
+instance both threads hold. Setting `Cancel` on one thread is seen by the other
+at its next check.
+
+**UI access from the worker**
+
+Windows Forms controls may only be touched from the thread that created them, so
+`Write-Log`, `Update-UIState`, `Set-ActionsEnabled` and `Show-Balloon` all
+marshal through `Invoke-OnUI`, which uses `Control.Invoke`.
+
+One subtlety cost a debugging round and is worth recording: **a `$Script:`
+reference inside a marshalled script block resolves against the UI thread's
+scope, not the worker's.** The worker's `$Script:LogBox` is not the UI thread's,
+so the block silently wrote to `$null`. Every marshalled block therefore captures
+the control into a **local** first, and uses `.GetNewClosure()` so the closure
+carries it across:
+
+```powershell
+$box = $Script:LogBox            # capture BEFORE building the closure
+Invoke-OnUI { $box.AppendText(...) }.GetNewClosure()
+```
+
+**Measured**
+
+UI-loop iterations observed while a worker ran a full connect: **444 over
+24.5 s**. The same measurement against the old design would be approximately
+zero, because the UI thread was inside the sequence. Cross-thread cancellation
+was verified separately: the UI thread set the flag and the worker unwound.
+
+The UAC elevation in `Disconnect-VPNCore` behaves the same on a worker thread —
+the prompt is raised by the OS against the process, not the thread.
 
 ### Option B — a Windows service running as SYSTEM
 
@@ -175,7 +205,7 @@ window suppressed or started directly to the tray.
 
 This runs in the interactive session, so window automation works. It removes the
 visible window that invites the stray click, and it replaces the Startup-folder
-shortcut created by `Set-AutoStart` ([AutoVPN.ps1:1306](../AutoVPN.ps1)) with
+shortcut created by `Set-AutoStart` ([AutoVPN.ps1:1449](../AutoVPN.ps1)) with
 something more controllable.
 
 It is a mitigation, not a fix. The re-entrancy in cause 1 is still present; there
@@ -217,13 +247,14 @@ setup, which suggests certificate auth is not configured here.
 
 ### Recommendation
 
-The reported symptom is fixed by the guard-and-cancel work described under
-Cause 2, not by any of these options.
+Options A and C are both implemented — A moves the work off the UI thread, and
+the guards under Cause 2 close the re-entrancy that made stray clicks dangerous
+in the first place. Together they fix the reported symptom.
 
-Option C remains a worthwhile addition — it removes the window that invites the
-stray click in the first place. Option A is only needed for a genuinely headless
-mode. Options B and D are ruled out and recorded so they are not
-re-investigated: B is blocked by session 0 isolation, D by gateway policy.
+Option C (a hidden logon task) remains available and is the natural next step if
+the window itself should stop appearing. Options B and D are ruled out and
+recorded so they are not re-investigated: B is blocked by session 0 isolation,
+D by gateway policy.
 
 ## Smaller changes
 

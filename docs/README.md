@@ -30,7 +30,8 @@ The most common question this knowledge base answers:
 
 > Why does the automation sometimes stop partway through when I click something?
 
-The short answer is that the entire connect sequence runs on the Windows Forms
-UI thread and pumps the message loop while it waits. The long answer, with the
-exact mechanism and the three ways to fix it, is in
-[04-background-service.md](04-background-service.md).
+It used to, and the cause was structural: the connect sequence ran on the
+Windows Forms UI thread and pumped the message loop while waiting, so any click
+re-entered it. The sequence now runs on a worker thread and the entry points that
+could re-enter it are gated. The mechanism, the fix, and the options that were
+ruled out are in [04-background-service.md](04-background-service.md).

@@ -79,7 +79,7 @@ to break on a client upgrade.
 | `SSL VPN-Plus Client` | Both the systray window when connected **and** the "connection established" notification popup |
 
 The last entry is ambiguous by design. `Dismiss-SVPNotification`
-([AutoVPN.ps1:704](../AutoVPN.ps1)) disambiguates by probing for an OK button
+([AutoVPN.ps1:757](../AutoVPN.ps1)) disambiguates by probing for an OK button
 (`GetDlgItem` with ID 2, then ID 1) and doing nothing when neither is present.
 
 Note also that `SSL VPN-Plus Client` is a substring of
@@ -138,7 +138,7 @@ controls by less reliable means.
 | 1079 | `&View Certificate` |
 | 1281, 1285, 1286, 1287, 1288 | Static text describing the certificate problems |
 
-`Handle-SecurityAlert` ([AutoVPN.ps1:456](../AutoVPN.ps1)) matches on the button
+`Handle-SecurityAlert` ([AutoVPN.ps1:509](../AutoVPN.ps1)) matches on the button
 **text** `&Yes`/`Yes`, which works. Its documented fallback of
 `GetDlgItem(hwnd, 6)` (`IDYES`) is **wrong for this dialog** — the Yes button is
 1278, not 6. If the text match ever fails, the fallback fails too.
@@ -238,10 +238,10 @@ Two safe alternatives:
 ```
 
 All four click sites have been migrated: the Login button
-([AutoVPN.ps1:447](../AutoVPN.ps1)), the Security Alert Yes button
-([AutoVPN.ps1:494](../AutoVPN.ps1)), the auth OK button
-([AutoVPN.ps1:620](../AutoVPN.ps1)), and the notification dismiss
-([AutoVPN.ps1:720](../AutoVPN.ps1)). They route through `Win32::ClickHandle`,
+([AutoVPN.ps1:500](../AutoVPN.ps1)), the Security Alert Yes button
+([AutoVPN.ps1:547](../AutoVPN.ps1)), the auth OK button
+([AutoVPN.ps1:673](../AutoVPN.ps1)), and the notification dismiss
+([AutoVPN.ps1:773](../AutoVPN.ps1)). They route through `Win32::ClickHandle`,
 which posts rather than sends. `SendMessage` remains declared because the
 timeout variants share its P/Invoke block, but no PowerShell code calls it.
 

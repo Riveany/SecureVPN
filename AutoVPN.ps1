@@ -237,30 +237,42 @@ $Script:StatusIcon  = $null
 $Script:ConnectBtn  = $null
 $Script:DisconnectBtn = $null
 $Script:TrayIcon    = $null
-$Script:IsConnecting = $false
 
 # Controls that are NOT part of the form's Controls collection, or that
-# Update-UIState would otherwise be unable to reach. The connect sequence pumps
-# the message loop while it waits, so every enabled entry point can run nested
-# inside it - these have to be disabled for the duration alongside the two main
-# buttons. See docs/04-background-service.md.
+# Update-UIState would otherwise be unable to reach. ContextMenuStrip items
+# carry their own Enabled property, so disabling the form's buttons does nothing
+# for them. See docs/04-background-service.md.
 $Script:SettingsBtn    = $null
 $Script:TrayConnect    = $null
 $Script:TrayDisconnect = $null
 $Script:TraySettings   = $null
 
-# Set when the user asks to cancel an in-flight connect. Every polling loop in
-# the automation engine checks it, so a cancel takes effect at the next poll
-# rather than at the end of the current step's timeout.
-$Script:CancelRequested = $false
 
-# Guards Disconnect-VPN the way $Script:IsConnecting guards Connect-VPN.
-$Script:IsDisconnecting = $false
+# --- Background worker -----------------------------------------------------
+# The automation engine runs on its own thread, so the UI thread is never blocked
+# and never has to pump the message loop mid-sequence. Windows Forms controls may
+# only be touched from the thread that created them, so everything the worker
+# wants to show goes through Invoke-OnUI, which marshals via Control.Invoke.
+$Script:Worker         = $null   # PowerShell instance doing the work
+$Script:WorkerHandle   = $null   # its IAsyncResult
+$Script:WorkerRunspace = $null
+$Script:WorkerPoll     = $null   # UI-thread timer that reaps the worker
+
+# A separate runspace does NOT share $Script: variables - verified, not assumed.
+# Flags that both threads must see live in this synchronized hashtable instead,
+# which is handed to the worker runspace as $SharedState. The $Script:* flags
+# above remain the UI thread's view and are kept in step with it.
+$Script:Shared = [hashtable]::Synchronized(@{
+    Cancel               = $false
+    DisconnectAfterCancel = $false
+    IsConnecting         = $false
+    IsDisconnecting      = $false
+})
 
 # Set when a disconnect was requested during a connect. Connect-VPN's finally
 # block performs the disconnect once its own stack has unwound, which avoids
 # the deadlock of waiting for it from inside its own message pump.
-$Script:DisconnectAfterCancel = $false
+$Script:Shared.DisconnectAfterCancel = $false
 #endregion
 
 #region [3] Config Management
@@ -349,20 +361,61 @@ function Reset-VpnCredential {
 #endregion
 
 #region [5] Logging
+<#
+.SYNOPSIS
+    Run a script block on the UI thread.
+.DESCRIPTION
+    Windows Forms controls may only be touched from the thread that created
+    them. The automation engine runs on a worker thread, so every control access
+    it makes has to be marshalled. Control.Invoke does that, and blocks until
+    the UI thread has run the block - which is what we want, since the caller
+    usually wants the UI to reflect reality before it moves on.
+
+    Falls through to a direct call when there is no form yet (startup, or the
+    headless test harness), or when we are already on the UI thread.
+#>
+function Invoke-OnUI {
+    param([scriptblock]$Action)
+
+    $form = $Script:MainForm
+    if (-not $form -or $form.IsDisposed -or -not $form.IsHandleCreated) {
+        try { & $Action } catch { }
+        return
+    }
+
+    try {
+        if ($form.InvokeRequired) {
+            $form.Invoke([Action]$Action) | Out-Null
+        } else {
+            & $Action
+        }
+    } catch {
+        # Form torn down between the check and the call - nothing to update.
+    }
+}
+
 function Write-Log {
     param([string]$Message, [string]$Color = "White")
 
     $timestamp = Get-Date -Format "HH:mm:ss"
     $line = "[$timestamp] $Message"
 
-    if ($Script:LogBox -and -not $Script:LogBox.IsDisposed) {
-        try {
-            $Script:LogBox.AppendText("$line`r`n")
-            $Script:LogBox.SelectionStart = $Script:LogBox.TextLength
-            $Script:LogBox.ScrollToCaret()
-        } catch {
-            # Form not ready yet - ignore
-        }
+    # Capture the control into a local BEFORE building the closure. $Script:
+    # inside a marshalled block resolves against the UI thread's scope, where
+    # the worker's variables do not exist; a local is carried by the closure.
+    $box = $Script:LogBox
+    if ($box) {
+        Invoke-OnUI {
+            if (-not $box.IsDisposed) {
+                try {
+                    $box.AppendText("$line`r`n")
+                    $box.SelectionStart = $box.TextLength
+                    $box.ScrollToCaret()
+                } catch {
+                    # Form not ready yet - ignore
+                }
+            }
+        }.GetNewClosure()
     }
 
     Write-Host $line -ForegroundColor $Color
@@ -706,7 +759,7 @@ function Dismiss-SVPNotification {
     # This is a small #32770 dialog from SVPClient with title "SSL VPN-Plus Client" and OK button
     $maxAttempts = 5
     for ($i = 0; $i -lt $maxAttempts; $i++) {
-        if ($Script:CancelRequested) { return }
+        if ($Script:Shared.Cancel) { return }
 
         $hwnd = [Win32]::FindWindowByTitle("SSL VPN-Plus Client")
         if ($hwnd -ne [IntPtr]::Zero) {
@@ -726,14 +779,20 @@ function Dismiss-SVPNotification {
     }
 }
 
+<#
+.SYNOPSIS
+    Sleep that gives up early when a cancel arrives.
+.DESCRIPTION
+    Named for what it used to be. It no longer pumps the message loop: the
+    automation runs on a worker thread, where DoEvents would pump nothing and
+    Application::DoEvents is not the worker's to call. The UI thread stays
+    responsive on its own because it is not blocked in the first place.
+#>
 function DoEvents-Sleep {
     param([int]$Milliseconds)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($sw.ElapsedMilliseconds -lt $Milliseconds) {
-        [System.Windows.Forms.Application]::DoEvents()
-        # Stop waiting the moment a cancel arrives, so the caller's next
-        # Test-Cancelled check fires without burning the rest of this sleep.
-        if ($Script:CancelRequested) { return }
+        if ($Script:Shared.Cancel) { return }
         Start-Sleep -Milliseconds 100
     }
 }
@@ -746,7 +805,7 @@ function DoEvents-Sleep {
     per check so the activity log shows where the sequence stopped.
 #>
 function Test-Cancelled {
-    if ($Script:CancelRequested) {
+    if ($Script:Shared.Cancel) {
         Write-Log "Cancel requested - stopping connect sequence" "Yellow"
         return $true
     }
@@ -768,28 +827,54 @@ function Set-ActionsEnabled {
         [bool]$AllowDisconnect = $false
     )
 
-    try {
-        if ($Script:SettingsBtn)    { $Script:SettingsBtn.Enabled    = $Enabled }
-        if ($Script:TraySettings)   { $Script:TraySettings.Enabled   = $Enabled }
-        if ($Script:TrayConnect)    { $Script:TrayConnect.Enabled    = $Enabled }
-        if ($Script:TrayDisconnect) { $Script:TrayDisconnect.Enabled = ($Enabled -or $AllowDisconnect) }
-    } catch {
-        # Controls not built yet - ignore
-    }
+    $sb = $Script:SettingsBtn; $ts = $Script:TraySettings
+    $tc = $Script:TrayConnect;  $td = $Script:TrayDisconnect
+    $canDisconnect = ($Enabled -or $AllowDisconnect)
+
+    Invoke-OnUI {
+        try {
+            if ($sb) { $sb.Enabled = $Enabled }
+            if ($ts) { $ts.Enabled = $Enabled }
+            if ($tc) { $tc.Enabled = $Enabled }
+            if ($td) { $td.Enabled = $canDisconnect }
+        } catch {
+            # Controls not built yet - ignore
+        }
+    }.GetNewClosure()
 }
 
-function Connect-VPN {
-    if ($Script:IsConnecting) {
+<#
+.SYNOPSIS
+    Show a tray balloon from either thread.
+#>
+function Show-Balloon {
+    param([string]$Text, [string]$Icon = "Info")
+
+    $tray = $Script:TrayIcon
+    if (-not $tray) { return }
+
+    Invoke-OnUI {
+        try {
+            $tray.BalloonTipTitle = "AutoVPN"
+            $tray.BalloonTipText  = $Text
+            $tray.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::$Icon
+            $tray.ShowBalloonTip(3000)
+        } catch { }
+    }.GetNewClosure()
+}
+
+function Connect-VPNCore {
+    if ($Script:Shared.IsConnecting) {
         Write-Log "Connection already in progress..." "Yellow"
         return
     }
-    if ($Script:IsDisconnecting) {
+    if ($Script:Shared.IsDisconnecting) {
         Write-Log "Disconnect in progress - please wait" "Yellow"
         return
     }
 
-    $Script:IsConnecting = $true
-    $Script:CancelRequested = $false
+    $Script:Shared.IsConnecting = $true
+    $Script:Shared.Cancel = $false
     Update-UIState "Connecting"
     # Leave Disconnect reachable so the user can cancel; block everything else.
     Set-ActionsEnabled -Enabled $false -AllowDisconnect $true
@@ -805,7 +890,6 @@ function Connect-VPN {
 
         # Step 1: Start SVPClient
         Write-Log "Step 1: Starting SVPClient..." "Yellow"
-        [System.Windows.Forms.Application]::DoEvents()
         if (-not (Start-SVPClient)) {
             Update-UIState "Error"
             return
@@ -815,7 +899,6 @@ function Connect-VPN {
 
         # Step 2: Find Login window
         Write-Log "Step 2: Finding Login window..." "Yellow"
-        [System.Windows.Forms.Application]::DoEvents()
         $loginResult = Find-SVPLoginWindow -TimeoutSeconds 15
         if ($loginResult.Status -eq "connected") {
             Update-UIState "Connected"
@@ -832,7 +915,6 @@ function Connect-VPN {
 
         # Step 3: Click Login button
         Write-Log "Step 3: Clicking Login..." "Yellow"
-        [System.Windows.Forms.Application]::DoEvents()
         if (-not (Click-LoginButton -LoginWindowHwnd $loginHwnd)) {
             Update-UIState "Error"
             return
@@ -842,7 +924,6 @@ function Connect-VPN {
 
         # Step 4: Handle Security Alert (certificate dialog)
         Write-Log "Step 4: Checking for Security Alert..." "Yellow"
-        [System.Windows.Forms.Application]::DoEvents()
         Handle-SecurityAlert -TimeoutSeconds 10 | Out-Null
 
         DoEvents-Sleep 1000
@@ -851,10 +932,9 @@ function Connect-VPN {
 
         # Step 5: Find Auth window
         Write-Log "Step 5: Waiting for Authentication..." "Yellow"
-        [System.Windows.Forms.Application]::DoEvents()
         $authHwnd = Find-AuthWindow -TimeoutSeconds 20
 
-        if ($Script:CancelRequested) { return }
+        if ($Script:Shared.Cancel) { return }
 
         if ($authHwnd -eq [IntPtr]::Zero) {
             # Check if VPN connected anyway
@@ -870,12 +950,7 @@ function Connect-VPN {
         if ($authHwnd.ToInt64() -eq -1) {
             # Special: connected without needing auth
             Update-UIState "Connected"
-            if ($Script:TrayIcon) {
-                $Script:TrayIcon.BalloonTipTitle = "AutoVPN"
-                $Script:TrayIcon.BalloonTipText = "VPN Connected"
-                $Script:TrayIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
-                $Script:TrayIcon.ShowBalloonTip(3000)
-            }
+            Show-Balloon "VPN Connected" "Info"
             return
         }
 
@@ -883,7 +958,6 @@ function Connect-VPN {
 
         # Step 6: Fill auth form
         Write-Log "Step 6: Filling credentials..." "Yellow"
-        [System.Windows.Forms.Application]::DoEvents()
         $username = $cred.Username
         $password = $cred.Password
         $result = Fill-AuthForm -AuthWindowHwnd $authHwnd -Username $username -Password $password
@@ -900,7 +974,6 @@ function Connect-VPN {
 
         # Step 7: Verify connection
         Write-Log "Step 7: Verifying connection..." "Yellow"
-        [System.Windows.Forms.Application]::DoEvents()
         DoEvents-Sleep 3000
         if (Test-VpnConnected -TimeoutSeconds 30) {
             Update-UIState "Connected"
@@ -908,12 +981,7 @@ function Connect-VPN {
             # Auto-dismiss "connection established" notification from SVPClient
             Dismiss-SVPNotification
 
-            if ($Script:TrayIcon) {
-                $Script:TrayIcon.BalloonTipTitle = "AutoVPN"
-                $Script:TrayIcon.BalloonTipText = "VPN Connected"
-                $Script:TrayIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
-                $Script:TrayIcon.ShowBalloonTip(3000)
-            }
+            Show-Balloon "VPN Connected" "Info"
         } else {
             # Still try to dismiss notification even if verification times out
             Dismiss-SVPNotification
@@ -924,9 +992,9 @@ function Connect-VPN {
         Write-Log "ERROR: $($_.Exception.Message)" "Red"
         Update-UIState "Error"
     } finally {
-        $Script:IsConnecting = $false
+        $Script:Shared.IsConnecting = $false
 
-        if ($Script:CancelRequested) {
+        if ($Script:Shared.Cancel) {
             # The sequence was abandoned partway through. Report the real
             # adapter state rather than assuming either outcome.
             Write-Log "Connect sequence cancelled" "Yellow"
@@ -936,38 +1004,23 @@ function Connect-VPN {
 
         Set-ActionsEnabled -Enabled $true
 
-        # A disconnect requested mid-connect deferred itself to here, where the
-        # connect sequence is off the stack and the two cannot overlap.
-        if ($Script:DisconnectAfterCancel) {
-            $Script:DisconnectAfterCancel = $false
-            $Script:CancelRequested = $false
-            Write-Log "Proceeding with requested disconnect..." "Yellow"
-            Disconnect-VPN
-        }
+        # A disconnect requested mid-connect is NOT run here. This is the worker
+        # thread; the UI-thread reaper in Start-VpnWorker starts a fresh worker
+        # for it once this one has been disposed.
     }
 }
 
-function Disconnect-VPN {
-    if ($Script:IsDisconnecting) {
+function Disconnect-VPNCore {
+    if ($Script:Shared.IsDisconnecting) {
         Write-Log "Disconnect already in progress..." "Yellow"
         return
     }
 
-    # Asked to disconnect while a connect is running.
-    #
-    # This handler is reached from inside the connect sequence's own message
-    # pump, so Connect-VPN is still on the stack below us. Waiting here for it
-    # to finish would deadlock: it cannot return until we do. Instead, record
-    # the request and return. Connect-VPN sees the cancel at its next check,
-    # unwinds, and its finally block calls back here on a clean stack.
-    if ($Script:IsConnecting) {
-        Write-Log "Cancelling connect in progress..." "Yellow"
-        $Script:CancelRequested = $true
-        $Script:DisconnectAfterCancel = $true
-        return
-    }
+    # Connect-VPNCore's finally block is the only caller that may invoke this
+    # while IsConnecting is still set - it does so as it unwinds, having already
+    # cleared the flag. Any other overlap is a bug in the dispatcher.
 
-    $Script:IsDisconnecting = $true
+    $Script:Shared.IsDisconnecting = $true
     Set-ActionsEnabled -Enabled $false
 
     try {
@@ -983,7 +1036,6 @@ function Disconnect-VPN {
     # SVPClient requires elevated privileges to kill (protected by NeoSrv service)
     # Must use RunAs to get admin rights - will trigger UAC prompt
     Write-Log "Stopping SVPClient (requires Admin)..." "Yellow"
-    [System.Windows.Forms.Application]::DoEvents()
 
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -994,7 +1046,6 @@ function Disconnect-VPN {
         $psi.CreateNoWindow = $true
         $elevatedProc = [System.Diagnostics.Process]::Start($psi)
         Write-Log "UAC accepted, killing SVPClient..." "Yellow"
-        [System.Windows.Forms.Application]::DoEvents()
         $elevatedProc.WaitForExit(10000)
         Write-Log "Kill command completed" "Green"
     } catch {
@@ -1026,12 +1077,7 @@ function Disconnect-VPN {
         if (-not $adapterUp) {
             Write-Log "VPN Disconnected!" "Green"
             Update-UIState "Disconnected"
-            if ($Script:TrayIcon) {
-                $Script:TrayIcon.BalloonTipTitle = "AutoVPN"
-                $Script:TrayIcon.BalloonTipText = "VPN Disconnected"
-                $Script:TrayIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
-                $Script:TrayIcon.ShowBalloonTip(3000)
-            }
+            Show-Balloon "VPN Disconnected" "Warning"
             return
         }
         Write-Log "  Waiting... ($waited/$maxWait)" "Yellow"
@@ -1047,13 +1093,125 @@ function Disconnect-VPN {
     }
 
     } finally {
-        $Script:IsDisconnecting = $false
-        $Script:CancelRequested = $false
-        $Script:DisconnectAfterCancel = $false
+        $Script:Shared.IsDisconnecting = $false
+        $Script:Shared.Cancel = $false
+        $Script:Shared.DisconnectAfterCancel = $false
         Set-ActionsEnabled -Enabled $true
     }
 }
 #endregion
+
+<#
+.SYNOPSIS
+    Run one of the *-VPNCore functions on a background thread.
+.DESCRIPTION
+    The worker shares this script's session state, so $Script: variables and
+    every automation function are the same objects the UI thread sees - there is
+    nothing to re-host and no state to copy. What the worker must NOT do is
+    touch a Windows Forms control directly; Write-Log, Update-UIState,
+    Set-ActionsEnabled and Show-Balloon all marshal through Invoke-OnUI.
+
+    A UI-thread timer reaps the worker when it finishes, so exceptions surface
+    in the log instead of vanishing on a thread nobody is watching.
+#>
+function Start-VpnWorker {
+    param([string]$Operation)   # "Connect" or "Disconnect"
+
+    if ($Script:Worker) {
+        Write-Log "A VPN operation is already running" "Yellow"
+        return
+    }
+
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $Script:WorkerRunspace
+    $ps.AddScript("$Operation-VPNCore") | Out-Null
+
+    $Script:Worker       = $ps
+    $Script:WorkerHandle = $ps.BeginInvoke()
+
+    # Poll for completion on the UI thread. This timer's tick is the only place
+    # the worker is disposed, which keeps ownership in one place. It also mirrors
+    # the shared flags back onto their $Script: counterparts so UI-thread code
+    # can read them without reaching into the hashtable.
+    $Script:WorkerPoll = New-Object System.Windows.Forms.Timer
+    $Script:WorkerPoll.Interval = 200
+    $Script:WorkerPoll.Add_Tick({
+        if (-not $Script:WorkerHandle -or -not $Script:WorkerHandle.IsCompleted) { return }
+
+        $Script:WorkerPoll.Stop()
+        $Script:WorkerPoll.Dispose()
+        $Script:WorkerPoll = $null
+
+        try {
+            $Script:Worker.EndInvoke($Script:WorkerHandle) | Out-Null
+
+            # Errors raised inside the worker land here, not on a thread nobody
+            # is watching.
+            foreach ($e in $Script:Worker.Streams.Error) {
+                Write-Log "Worker error: $($e.Exception.Message)" "Red"
+                Update-UIState "Error"
+            }
+        } catch {
+            Write-Log "Worker failed: $($_.Exception.Message)" "Red"
+            Update-UIState "Error"
+        } finally {
+            $Script:Worker.Dispose()
+            $Script:Worker = $null
+            $Script:WorkerHandle = $null
+        }
+
+        # A disconnect requested mid-connect runs now, on a clean stack, with the
+        # connect worker already reaped.
+        if ($Script:Shared.DisconnectAfterCancel) {
+            $Script:Shared.DisconnectAfterCancel = $false
+            $Script:Shared.Cancel = $false
+            Write-Log "Proceeding with requested disconnect..." "Yellow"
+            Start-VpnWorker "Disconnect"
+        }
+    })
+    $Script:WorkerPoll.Start()
+}
+
+<#
+.SYNOPSIS
+    Entry point for every Connect request (button, tray, auto-connect).
+#>
+function Connect-VPN {
+    if ($Script:Shared.IsConnecting) {
+        Write-Log "Connection already in progress..." "Yellow"
+        return
+    }
+    if ($Script:Shared.IsDisconnecting) {
+        Write-Log "Disconnect in progress - please wait" "Yellow"
+        return
+    }
+    Start-VpnWorker "Connect"
+}
+
+<#
+.SYNOPSIS
+    Entry point for every Disconnect request.
+.DESCRIPTION
+    Pressed during a connect, this cancels it rather than racing it. The worker
+    thread sees the flag at its next check and unwinds; its own finally block
+    then performs the disconnect. We do not wait here - the handler returns
+    immediately, and on the UI thread there is nothing to block anyway.
+#>
+function Disconnect-VPN {
+    if ($Script:Shared.IsDisconnecting) {
+        Write-Log "Disconnect already in progress..." "Yellow"
+        return
+    }
+
+    if ($Script:Shared.IsConnecting) {
+        Write-Log "Cancelling connect in progress..." "Yellow"
+        $Script:Shared.Cancel = $true
+        $Script:Shared.DisconnectAfterCancel = $true
+        return
+    }
+
+    Start-VpnWorker "Disconnect"
+}
 
 #region [7] UI State Management
 function Update-UIState {
@@ -1061,52 +1219,37 @@ function Update-UIState {
 
     if (-not $Script:MainForm -or $Script:MainForm.IsDisposed) { return }
 
-    try {
-        switch ($State) {
-            "Connected" {
-                $Script:StatusLabel.Text = "Connected"
-                $Script:StatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(34, 197, 94)
-                $Script:StatusIcon.BackColor = [System.Drawing.Color]::FromArgb(34, 197, 94)
-                $Script:ConnectBtn.Enabled = $false
-                $Script:DisconnectBtn.Enabled = $true
-                if ($Script:TrayIcon) { $Script:TrayIcon.Text = "AutoVPN - Connected" }
-            }
-            "Disconnected" {
-                $Script:StatusLabel.Text = "Disconnected"
-                $Script:StatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(239, 68, 68)
-                $Script:StatusIcon.BackColor = [System.Drawing.Color]::FromArgb(239, 68, 68)
-                $Script:ConnectBtn.Enabled = $true
-                $Script:DisconnectBtn.Enabled = $false
-                if ($Script:TrayIcon) { $Script:TrayIcon.Text = "AutoVPN - Disconnected" }
-            }
-            "Connecting" {
-                $Script:StatusLabel.Text = "Connecting..."
-                $Script:StatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(234, 179, 8)
-                $Script:StatusIcon.BackColor = [System.Drawing.Color]::FromArgb(234, 179, 8)
-                $Script:ConnectBtn.Enabled = $false
-                $Script:DisconnectBtn.Enabled = $false
-                if ($Script:TrayIcon) { $Script:TrayIcon.Text = "AutoVPN - Connecting..." }
-            }
-            "Disconnecting" {
-                $Script:StatusLabel.Text = "Disconnecting..."
-                $Script:StatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(234, 179, 8)
-                $Script:StatusIcon.BackColor = [System.Drawing.Color]::FromArgb(234, 179, 8)
-                $Script:ConnectBtn.Enabled = $false
-                $Script:DisconnectBtn.Enabled = $false
-            }
-            "Error" {
-                $Script:StatusLabel.Text = "Error"
-                $Script:StatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(239, 68, 68)
-                $Script:StatusIcon.BackColor = [System.Drawing.Color]::FromArgb(239, 68, 68)
-                $Script:ConnectBtn.Enabled = $true
-                $Script:DisconnectBtn.Enabled = $false
-                if ($Script:TrayIcon) { $Script:TrayIcon.Text = "AutoVPN - Error" }
-            }
-        }
-        [System.Windows.Forms.Application]::DoEvents()
-    } catch {
-        # Form not ready yet - ignore
+    # State table: text, colour, and which buttons are usable.
+    $green  = [System.Drawing.Color]::FromArgb(34, 197, 94)
+    $red    = [System.Drawing.Color]::FromArgb(239, 68, 68)
+    $amber  = [System.Drawing.Color]::FromArgb(234, 179, 8)
+
+    switch ($State) {
+        "Connected"     { $text = "Connected";     $col = $green; $canConnect = $false; $canDisconnect = $true  }
+        "Disconnected"  { $text = "Disconnected";  $col = $red;   $canConnect = $true;  $canDisconnect = $false }
+        "Connecting"    { $text = "Connecting..."; $col = $amber; $canConnect = $false; $canDisconnect = $false }
+        "Disconnecting" { $text = "Disconnecting..."; $col = $amber; $canConnect = $false; $canDisconnect = $false }
+        "Error"         { $text = "Error";         $col = $red;   $canConnect = $true;  $canDisconnect = $false }
+        default         { return }
     }
+
+    # Capture into locals so the closure carries them; $Script: inside a
+    # marshalled block resolves against the UI thread's scope, not the worker's.
+    $lbl = $Script:StatusLabel; $ico = $Script:StatusIcon
+    $cbtn = $Script:ConnectBtn; $dbtn = $Script:DisconnectBtn
+    $tray = $Script:TrayIcon
+
+    Invoke-OnUI {
+        try {
+            if ($lbl)  { $lbl.Text = $text; $lbl.ForeColor = $col }
+            if ($ico)  { $ico.BackColor = $col }
+            if ($cbtn) { $cbtn.Enabled = $canConnect }
+            if ($dbtn) { $dbtn.Enabled = $canDisconnect }
+            if ($tray) { $tray.Text = "AutoVPN - $text" }
+        } catch {
+            # Form not ready yet - ignore
+        }
+    }.GetNewClosure()
 }
 #endregion
 
@@ -1115,7 +1258,7 @@ function Show-SettingsDialog {
     # This dialog is modal. Opened from inside a running sequence - which the
     # message pump makes possible - it would hold that sequence frozen mid-step
     # while its timeouts kept running against the wall clock.
-    if ($Script:IsConnecting -or $Script:IsDisconnecting) {
+    if ($Script:Shared.IsConnecting -or $Script:Shared.IsDisconnecting) {
         Write-Log "Settings unavailable while a VPN operation is running" "Yellow"
         return
     }
@@ -1520,6 +1663,17 @@ function Build-MainForm {
 
     # Cleanup on close
     $form.Add_FormClosing({
+        # Ask any running sequence to stop, then give it a moment. The UI thread
+        # is about to go away, and Invoke-OnUI calls from the worker would throw
+        # once it does.
+        $Script:Shared.Cancel = $true
+        if ($Script:WorkerHandle -and -not $Script:WorkerHandle.IsCompleted) {
+            $Script:WorkerHandle.AsyncWaitHandle.WaitOne(3000) | Out-Null
+        }
+        if ($Script:WorkerPoll) { try { $Script:WorkerPoll.Stop(); $Script:WorkerPoll.Dispose() } catch { } }
+        if ($Script:Worker)     { try { $Script:Worker.Dispose() } catch { } }
+        if ($Script:WorkerRunspace) { try { $Script:WorkerRunspace.Close(); $Script:WorkerRunspace.Dispose() } catch { } }
+
         $Script:TrayIcon.Visible = $false
         $Script:TrayIcon.Dispose()
     })
@@ -1536,6 +1690,81 @@ function Main {
 
     # Build GUI
     $form = Build-MainForm
+
+    # Create the worker runspace once and reuse it; each operation gets its own
+    # PowerShell instance pointed at it. Built after the form so the worker can
+    # be handed the form handle it marshals through.
+    $Script:WorkerRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($Host)
+    $Script:WorkerRunspace.ApartmentState = [System.Threading.ApartmentState]::STA
+    $Script:WorkerRunspace.ThreadOptions  = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+    $Script:WorkerRunspace.Open()
+
+    # A new runspace starts empty - it does not inherit this script's functions.
+    # Feed it every function definition currently loaded here, plus the shared
+    # state and the config the automation reads. $Script: inside those functions
+    # resolves to the worker's own scope, so anything both threads must see
+    # lives in $Script:Shared, which is the same object on both sides.
+    $bootstrap = New-Object System.Text.StringBuilder
+    foreach ($fn in Get-ChildItem Function: | Where-Object { $_.Source -eq '' -or -not $_.Source }) {
+        if ($fn.Name -match '^(Connect|Disconnect|Find|Click|Handle|Fill|Test|Start|Dismiss|Write|Update|Set|Show|Invoke|Load|Save|Reset|Get|DoEvents)-') {
+            [void]$bootstrap.AppendLine("function $($fn.Name) {")
+            [void]$bootstrap.AppendLine($fn.Definition)
+            [void]$bootstrap.AppendLine("}")
+        }
+    }
+
+    $init = [System.Management.Automation.PowerShell]::Create()
+    $init.Runspace = $Script:WorkerRunspace
+    $init.AddScript($bootstrap.ToString()) | Out-Null
+    $init.Invoke() | Out-Null
+    if ($init.Streams.Error.Count) {
+        Write-Host "[WARN] Worker bootstrap: $($init.Streams.Error[0].Exception.Message)" -ForegroundColor Yellow
+    }
+    $init.Dispose()
+
+    # Bind the worker's own $Script: scope to the objects it needs. $Script:Shared
+    # is deliberately the SAME synchronized hashtable instance both threads use -
+    # that is the entire channel between them. The form reference lets the
+    # worker's Invoke-OnUI marshal back here; the rest are read-only inputs.
+    $bind = [System.Management.Automation.PowerShell]::Create()
+    $bind.Runspace = $Script:WorkerRunspace
+    $bind.AddScript(@'
+param($shared, $config, $dir, $form, $ui)
+$Script:Shared    = $shared
+$Script:Config    = $config
+$Script:ScriptDir = $dir
+$Script:MainForm  = $form
+$Script:LogBox         = $ui.LogBox
+$Script:StatusLabel    = $ui.StatusLabel
+$Script:StatusIcon     = $ui.StatusIcon
+$Script:ConnectBtn     = $ui.ConnectBtn
+$Script:DisconnectBtn  = $ui.DisconnectBtn
+$Script:TrayIcon       = $ui.TrayIcon
+$Script:SettingsBtn    = $ui.SettingsBtn
+$Script:TrayConnect    = $ui.TrayConnect
+$Script:TrayDisconnect = $ui.TrayDisconnect
+$Script:TraySettings   = $ui.TraySettings
+'@) | Out-Null
+    $bind.AddArgument($Script:Shared) | Out-Null
+    $bind.AddArgument($Script:Config) | Out-Null
+    $bind.AddArgument($Script:ScriptDir) | Out-Null
+    $bind.AddArgument($form) | Out-Null
+    # The control references themselves. The worker never touches these directly
+    # - every access goes through Invoke-OnUI, which marshals to the UI thread -
+    # but it needs the references to have something to marshal.
+    $bind.AddArgument(@{
+        LogBox = $Script:LogBox; StatusLabel = $Script:StatusLabel
+        StatusIcon = $Script:StatusIcon; ConnectBtn = $Script:ConnectBtn
+        DisconnectBtn = $Script:DisconnectBtn; TrayIcon = $Script:TrayIcon
+        SettingsBtn = $Script:SettingsBtn; TrayConnect = $Script:TrayConnect
+        TrayDisconnect = $Script:TrayDisconnect; TraySettings = $Script:TraySettings
+    }) | Out-Null
+    $bind.Invoke() | Out-Null
+    if ($bind.Streams.Error.Count) {
+        Write-Host "[WARN] Worker bind: $($bind.Streams.Error[0].Exception.Message)" -ForegroundColor Yellow
+    }
+    $bind.Dispose()
+
 
     Write-Log "AutoVPN v2.0 started" "Cyan"
     Write-Log "Network: $($Script:Config.connection_name)" "White"
