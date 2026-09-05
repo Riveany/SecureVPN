@@ -2,7 +2,7 @@
 
 ## What the program is
 
-`AutoVPN.ps1` is a single-file PowerShell application, roughly 1,800 lines,
+`AutoVPN.ps1` is a single-file PowerShell application, roughly 2,000 lines,
 that hosts a Windows Forms GUI and automates a third-party GUI application
 (`SVPClient.exe`, the VMware SSL VPN-Plus Client). It is launched through
 [`app.bat`](../app.bat), which runs PowerShell with `-STA -WindowStyle Hidden`,
@@ -20,17 +20,21 @@ navigate it.
 
 | Region | Lines | Responsibility |
 |---|---|---|
-| `[1] Assembly & Type Loading` | 9–219 | Loads Windows Forms and Drawing; compiles the inline C# `Win32` helper class |
-| `[2] Global Variables` | 221–276 | Script directory detection, `$Script:`-scoped state, the worker handles, and `$Script:Shared` |
-| `[3] Config Management` | 278–310 | Loads, creates, and saves `config.json`; resolves the credential file path |
-| `[4] Credential Management` | 312–361 | DPAPI encrypt/decrypt of the VPN username and password |
-| `[5] Logging` | 363–423 | `Invoke-OnUI` (the UI-thread marshaller) and `Write-Log` |
-| `[6] VPN Automation Engine` | 425–1214 | The connect and disconnect cores, their helpers, the cancellation checks, and the worker dispatchers |
-| `[7] UI State Management` | 1216–1254 | `Update-UIState` — the single place that sets status text, colour, and button enablement |
-| `[8] Settings Dialog` | 1256–1446 | Modal dialog for credentials, connection name, auto-connect, and auto-start |
-| `[9] Auto-Start Management` | 1448–1474 | Creates or removes a shortcut to `app.bat` in the user's Startup folder |
-| `[10] Main GUI` | 1476–1684 | `Build-MainForm` — the dark-themed form, tray icon, and event handlers |
-| `[11] Main Entry Point` | 1686–end | `Main`, the worker runspace setup, the STA guard, and the top-level `try`/`catch` |
+| `[1] Assembly & Type Loading` | 22–232 | Loads Windows Forms and Drawing; compiles the inline C# `Win32` helper class |
+| `[2] Global Variables` | 234–289 | Script directory detection, `$Script:`-scoped state, the worker handles, and `$Script:Shared` |
+| `[3] Config Management` | 291–323 | Loads, creates, and saves `config.json`; resolves the credential file path |
+| `[4] Credential Management` | 325–374 | DPAPI encrypt/decrypt of the VPN username and password |
+| `[5] Logging` | 376–436 | `Invoke-OnUI` (the UI-thread marshaller) and `Write-Log` |
+| `[6] VPN Automation Engine` | 438–1227 | The connect and disconnect cores, their helpers, the cancellation checks, and the worker dispatchers |
+| `[7] UI State Management` | 1229–1267 | `Update-UIState` — the single place that sets status text, colour, and button enablement |
+| `[8] Settings Dialog` | 1269–1475 | Modal dialog for credentials, connection name, auto-connect, auto-start, and tray behaviour |
+| `[9] Auto-Start Management` | 1477–1607 | `Get-AutoStartCommand`, `Test-AutoStart`, `Set-AutoStart` — the hidden logon task |
+| `[10] Main GUI` | 1609–1817 | `Build-MainForm` — the dark-themed form, tray icon, and event handlers |
+| `[11] Main Entry Point` | 1819–end | `Main`, the worker runspace setup, the STA guard, and the top-level `try`/`catch` |
+
+The script now opens with a `param([switch]$Background)` block before region 1;
+a `param()` must be the first statement in a file, so it sits above the banner
+comment's usual position.
 
 The automation engine holds both the thread-agnostic work (`Connect-VPNCore`,
 `Disconnect-VPNCore`) and the dispatchers that run it on the worker
@@ -44,7 +48,7 @@ The application has **two threads**: the Windows Forms UI thread, and a worker
 that runs the VPN automation.
 
 `Main` ends with `[System.Windows.Forms.Application]::Run($form)`
-([AutoVPN.ps1:1808](../AutoVPN.ps1)), which starts the message loop on the UI
+([AutoVPN.ps1:1960](../AutoVPN.ps1)), which starts the message loop on the UI
 thread. Before that it creates `$Script:WorkerRunspace` — an STA runspace that
 every connect and disconnect runs on.
 
@@ -153,7 +157,7 @@ and fail to find `config.json`.
 
 Windows Forms requires a single-threaded apartment. The entry point checks the
 current thread's apartment state and, if it is not STA, relaunches itself with
-the correct flag and exits ([AutoVPN.ps1:1812](../AutoVPN.ps1)). The relaunch
+the correct flag and exits ([AutoVPN.ps1:1964](../AutoVPN.ps1)). The relaunch
 path differs for script and executable, mirroring the directory detection above.
 
 This is why [`app.bat`](../app.bat) passes `-STA` explicitly — it avoids the

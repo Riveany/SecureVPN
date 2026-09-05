@@ -3,7 +3,7 @@
 ## `config.json`
 
 Created automatically on first run by `Load-Config`
-([AutoVPN.ps1:279](../AutoVPN.ps1)) if absent or unparseable. Written by
+([AutoVPN.ps1:292](../AutoVPN.ps1)) if absent or unparseable. Written by
 `Save-Config` as UTF-8 JSON. Gitignored.
 
 Located beside the script or executable, at `$Script:ScriptDir\config.json`.
@@ -13,8 +13,8 @@ Located beside the script or executable, at `$Script:ScriptDir\config.json`.
 | `vpn_client_path` | string | `C:\Program Files (x86)\VMware\SSL VPN-Plus Client\SVPClient.exe` | Absolute path to the VMware client executable. Validated with `Test-Path` before launch. |
 | `connection_name` | string | `ADA-VPN` | Display label only. Shown in the GUI and in the startup log line. It is **not** used to select a network in the client — the client's own selection is used as-is. |
 | `auto_connect` | bool | `false` | When true, `Main` schedules `Connect-VPN` on a 1-second timer after the form is shown. |
-| `minimize_to_tray` | bool | `true` | When true, minimising the window hides it instead ([AutoVPN.ps1:1659](../AutoVPN.ps1)). |
-| `credential_file` | string | `vpn_cred.dat` | Path to the credential store. Resolved relative to `$Script:ScriptDir` unless already rooted ([AutoVPN.ps1:305](../AutoVPN.ps1)). |
+| `minimize_to_tray` | bool | `true` | When true, minimising the window hides it instead ([AutoVPN.ps1:1792](../AutoVPN.ps1)). |
+| `credential_file` | string | `vpn_cred.dat` | Path to the credential store. Resolved relative to `$Script:ScriptDir` unless already rooted ([AutoVPN.ps1:318](../AutoVPN.ps1)). |
 | `version` | string | `2.0` | Config schema version. Written but never read. |
 
 The file is loaded exactly once, at the start of `Main`. Manual edits require a
@@ -26,7 +26,7 @@ syntax error loses the previous settings.
 
 ## `vpn_cred.dat`
 
-Created by `Save-VpnCredential` ([AutoVPN.ps1:313](../AutoVPN.ps1)). Gitignored.
+Created by `Save-VpnCredential` ([AutoVPN.ps1:326](../AutoVPN.ps1)). Gitignored.
 
 ### Format
 
@@ -58,7 +58,7 @@ Protection API with the current user's key. The consequences:
 
 If decryption fails, `Load-VpnCredential` catches the exception, logs
 `Failed to load credentials`, and returns `$null`
-([AutoVPN.ps1:328](../AutoVPN.ps1)). The connect sequence then aborts and directs
+([AutoVPN.ps1:341](../AutoVPN.ps1)). The connect sequence then aborts and directs
 the user to Settings.
 
 ### Plaintext exposure
@@ -67,11 +67,11 @@ The password exists in plaintext in process memory in two places:
 
 1. Inside `Load-VpnCredential`, which converts the `SecureString` back to a plain
    string via `PSCredential.GetNetworkCredential().Password`
-   ([AutoVPN.ps1:328](../AutoVPN.ps1)) and returns it in a hashtable.
+   ([AutoVPN.ps1:341](../AutoVPN.ps1)) and returns it in a hashtable.
 2. In `Connect-VPN`, which holds it until `Fill-AuthForm` has sent it.
 
 `Connect-VPN` nulls both variables and calls `[System.GC]::Collect()` immediately
-after use ([AutoVPN.ps1:968](../AutoVPN.ps1)). This shortens the exposure window
+after use ([AutoVPN.ps1:981](../AutoVPN.ps1)). This shortens the exposure window
 but does not eliminate it — .NET string interning and the `WM_SETTEXT` payload
 mean the value may still be recoverable from a memory dump.
 
@@ -80,25 +80,42 @@ text, so the plaintext must exist at some point.
 
 ### Deletion
 
-`Reset-VpnCredential` ([AutoVPN.ps1:354](../AutoVPN.ps1)) removes the file with
+`Reset-VpnCredential` ([AutoVPN.ps1:367](../AutoVPN.ps1)) removes the file with
 `Remove-Item -Force`. It is a plain delete, not a secure wipe.
 
-## Auto-start shortcut
+## Auto-start task
 
-`Set-AutoStart` ([AutoVPN.ps1:1449](../AutoVPN.ps1)) creates or removes
-`AutoVPN.lnk` in the current user's Startup folder
-(`[Environment]::GetFolderPath("Startup")`).
+`Set-AutoStart` registers or removes a scheduled task named **`AutoVPN`**,
+triggered at logon for the current user. Inspect it with:
 
-The shortcut targets [`app.bat`](../app.bat), sets the working directory to
-`$Script:ScriptDir`, and uses `WindowStyle = 7` (minimised).
+```powershell
+Get-ScheduledTask -TaskName AutoVPN | Select-Object -ExpandProperty Settings
+(Get-ScheduledTask -TaskName AutoVPN).Actions[0]
+```
 
-Note that it targets `app.bat` specifically, not `AutoVPN.exe`. Enabling
-auto-start from a compiled build still creates a shortcut to the batch launcher,
-which in turn runs the `.ps1` from its own hardcoded absolute path. If
-`app.bat` is absent the function silently does nothing.
+Registered settings: `Hidden`, `LogonType = Interactive`, `RunLevel = Limited`,
+no execution time limit, and battery-safe (`AllowStartIfOnBatteries`,
+`DontStopIfGoingOnBatteries`). Interactive is not optional — the automation
+drives SVPClient's windows, which do not exist in session 0. See
+[04-background-service.md](04-background-service.md).
 
-An alternative that avoids both the Startup folder and the visible window is
-described as Option C in [04-background-service.md](04-background-service.md).
+The action runs `powershell.exe -ExecutionPolicy Bypass -STA -WindowStyle Hidden
+-File "<dir>\AutoVPN.ps1" -Background`, resolved by `Get-AutoStartCommand` from
+whatever sits beside the running script.
+
+`Test-AutoStart` reports whether the task exists; the Settings checkbox reads it,
+and Save only touches the task when the checkbox actually changed.
+
+### Replaced: the Startup shortcut
+
+Earlier versions wrote `AutoVPN.lnk` into
+`[Environment]::GetFolderPath("Startup")`, targeting `app.bat`. That was fragile:
+`app.bat` hardcodes `D:\SecureVPN\AutoVPN.ps1`, so a copy of the project
+elsewhere would have launched the wrong script.
+
+`Set-AutoStart` deletes any leftover `AutoVPN.lnk` on **every** call, enable or
+disable, so a machine upgrading from an older version cannot end up with both
+launchers firing.
 
 ## Icons
 
@@ -109,7 +126,7 @@ described as Option C in [04-background-service.md](04-background-service.md).
 
 The tray icon is not loaded from either file. It is drawn at runtime — a
 DodgerBlue filled ellipse on a 16×16 bitmap, converted with `Icon.FromHandle`
-([AutoVPN.ps1:1611](../AutoVPN.ps1)). Its colour does not change with connection
+([AutoVPN.ps1:1744](../AutoVPN.ps1)). Its colour does not change with connection
 state; only the tooltip text does, via `Update-UIState`.
 
 `Icon.FromHandle` is used without a matching `DestroyIcon` call, so the icon

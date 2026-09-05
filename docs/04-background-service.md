@@ -197,20 +197,53 @@ Unless a command-line or API-driven connection method for the VMware client is
 identified, a true SYSTEM service is not achievable. That would be a different
 integration entirely, not a refactor of this one.
 
-### Option C — a hidden scheduled task at user logon
+### Option C — a hidden scheduled task at user logon (DONE)
 
-Register a scheduled task that runs at logon under the user's own account, with
-`Run whether user is logged on or not` left off, `Hidden` set, and the AutoVPN
-window suppressed or started directly to the tray.
+`Set-AutoStart` registers a scheduled task named `AutoVPN` instead of dropping a
+shortcut in the Startup folder.
 
-This runs in the interactive session, so window automation works. It removes the
-visible window that invites the stray click, and it replaces the Startup-folder
-shortcut created by `Set-AutoStart` ([AutoVPN.ps1:1449](../AutoVPN.ps1)) with
-something more controllable.
+| Property | Value | Why |
+|---|---|---|
+| Trigger | At logon, current user | Matches what the Startup shortcut did |
+| `Hidden` | true | Keeps it out of the visible task list |
+| `LogonType` | **Interactive** | Required — SVPClient's windows do not exist in session 0 |
+| `RunLevel` | Limited | No elevation; task creation itself needs none |
+| `ExecutionTimeLimit` | 0 (none) | A tray app runs indefinitely; the default would kill it |
+| Battery | Start allowed, not stopped | The default refuses to start on battery |
 
-It is a mitigation, not a fix. The re-entrancy in cause 1 is still present; there
-is simply less opportunity to trigger it. Interacting with the tray menu during a
-connection would still re-enter the sequence.
+It also deletes any leftover `AutoVPN.lnk` from earlier versions, so the two
+launchers can never both fire.
+
+### Why the old shortcut was replaced
+
+It pointed at `app.bat`, which hardcodes `D:\SecureVPN\AutoVPN.ps1` — a copy of
+the project in another folder would have launched the wrong script. The task
+targets whichever launcher actually sits beside it.
+
+### `-Background`
+
+`-WindowStyle Hidden` suppresses the **PowerShell console**, not the
+application's own window. Without more, a logon task would still put a window in
+the user's face. The script therefore takes a `-Background` switch that starts it
+minimised, out of the taskbar, and hidden on `Shown` — tray only.
+
+**Known limitation, verified:** `-Background` works when AutoVPN runs as a
+`.ps1`. A PS2EXE-compiled `AutoVPN.exe` still shows its window despite receiving
+the switch on its command line; the cause was not identified. A minimal PS2EXE
+probe *did* receive the switch correctly into `param()`, so it is something about
+this script's startup rather than PS2EXE argument passing in general.
+
+Because of that, `Get-AutoStartCommand` prefers the `.ps1` for the logon task
+even when the exe is present, and falls back to the exe only if no `.ps1` exists
+— in which case the window will be visible at logon.
+
+### Auto-start is now its own setting
+
+The Settings dialog previously had one checkbox, "Auto-connect when program
+starts", which silently also controlled auto-start: a user who wanted the VPN to
+connect on launch had no way to avoid launching at logon too. There are now two
+independent checkboxes, and saving other settings no longer re-registers the
+task.
 
 ### Option D — let the client log in by itself (RULED OUT)
 
@@ -247,14 +280,12 @@ setup, which suggests certificate auth is not configured here.
 
 ### Recommendation
 
-Options A and C are both implemented — A moves the work off the UI thread, and
-the guards under Cause 2 close the re-entrancy that made stray clicks dangerous
-in the first place. Together they fix the reported symptom.
+Options A and C are both implemented. A moves the work off the UI thread; the
+guards under Cause 2 close the re-entrancy that made stray clicks dangerous; C
+removes the window that invited the stray click in the first place.
 
-Option C (a hidden logon task) remains available and is the natural next step if
-the window itself should stop appearing. Options B and D are ruled out and
-recorded so they are not re-investigated: B is blocked by session 0 isolation,
-D by gateway policy.
+Options B and D are ruled out and recorded so they are not re-investigated: B is
+blocked by session 0 isolation, D by gateway policy.
 
 ## Smaller changes
 

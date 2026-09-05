@@ -6,6 +6,19 @@
 # for reliable, focus-independent automation.
 # ============================================================================
 
+# -Background starts straight to the tray with no window shown. The logon task
+# created by Set-AutoStart passes it: -WindowStyle Hidden only suppresses the
+# PowerShell console, not this application's own form, so without this the app
+# would still pop a window in the user's face at every logon.
+#
+# KNOWN LIMITATION: verified working when run as a .ps1. A PS2EXE-compiled
+# AutoVPN.exe still shows its window despite receiving the switch on its command
+# line - cause not yet identified. Set-AutoStart therefore prefers the .ps1 for
+# the logon task even on machines where the exe exists.
+param(
+    [switch]$Background
+)
+
 #region [1] Assembly & Type Loading
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -1265,7 +1278,7 @@ function Show-SettingsDialog {
 
     $settingsForm = New-Object System.Windows.Forms.Form
     $settingsForm.Text = "AutoVPN Settings"
-    $settingsForm.Size = New-Object System.Drawing.Size(420, 380)
+    $settingsForm.Size = New-Object System.Drawing.Size(420, 410)   # +30 for the auto-start checkbox
     $settingsForm.StartPosition = "CenterParent"
     $settingsForm.FormBorderStyle = "FixedDialog"
     $settingsForm.MaximizeBox = $false
@@ -1360,6 +1373,18 @@ function Show-SettingsDialog {
     $settingsForm.Controls.Add($chkAuto)
     $y += 28
 
+    # Start-with-Windows checkbox. Previously there was none: the auto-connect
+    # box above silently also controlled auto-start, so a user who wanted the
+    # VPN to connect on launch had no way to avoid launching at logon too.
+    $chkAutoStart = New-Object System.Windows.Forms.CheckBox
+    $chkAutoStart.Text = "Start with Windows (hidden, at logon)"
+    $chkAutoStart.Location = New-Object System.Drawing.Point(15, $y)
+    $chkAutoStart.Size = New-Object System.Drawing.Size(370, 25)
+    $chkAutoStart.ForeColor = [System.Drawing.Color]::White
+    $chkAutoStart.Checked = (Test-AutoStart)
+    $settingsForm.Controls.Add($chkAutoStart)
+    $y += 28
+
     # Minimize to tray checkbox
     $chkTray = New-Object System.Windows.Forms.CheckBox
     $chkTray.Text = "Minimize to system tray"
@@ -1394,8 +1419,12 @@ function Show-SettingsDialog {
         $Script:Config.minimize_to_tray = $chkTray.Checked
         Save-Config
 
-        # Handle auto-start shortcut
-        Set-AutoStart -Enable $chkAuto.Checked
+        # Auto-start is its own setting, independent of auto-connect. Only touch
+        # the scheduled task when the checkbox actually changed, so saving other
+        # settings does not re-register it.
+        if ($chkAutoStart.Checked -ne (Test-AutoStart)) {
+            Set-AutoStart -Enable $chkAutoStart.Checked
+        }
 
         Write-Log "Settings saved." "Green"
         $settingsForm.DialogResult = "OK"
@@ -1446,29 +1475,133 @@ function Show-SettingsDialog {
 #endregion
 
 #region [9] Auto-Start Management
+# Name of the logon task. Kept in one place because both Set-AutoStart and
+# Test-AutoStart look it up, and a mismatch would silently orphan a task.
+$Script:TaskName = "AutoVPN"
+
+<#
+.SYNOPSIS
+    What auto-start would launch: the exe if this is a compiled build,
+    otherwise PowerShell running the script.
+.DESCRIPTION
+    Returns a hashtable with Path and Arguments, or $null if nothing suitable
+    exists. Deliberately does NOT use app.bat: the batch file hardcodes an
+    absolute script path, so a copy of the project in another folder would
+    launch the wrong one.
+#>
+function Get-AutoStartCommand {
+    $exe = Join-Path $Script:ScriptDir "AutoVPN.exe"
+    $ps1 = Join-Path $Script:ScriptDir "AutoVPN.ps1"
+
+    # Prefer the .ps1: -Background is verified to hide the window there, and is
+    # known NOT to work in the compiled exe (see the note on param() above).
+    # The exe is used only when no .ps1 is present, and then the window shows.
+    if (Test-Path $ps1) {
+        return @{
+            Path      = (Get-Command powershell.exe).Source
+            Arguments = "-ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$ps1`" -Background"
+        }
+    }
+    if (Test-Path $exe) {
+        # Falls back to the exe; note the window will be visible at logon.
+        return @{ Path = $exe; Arguments = "-Background" }
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+    True if the logon task exists.
+#>
+function Test-AutoStart {
+    try {
+        return $null -ne (Get-ScheduledTask -TaskName $Script:TaskName -ErrorAction SilentlyContinue)
+    } catch {
+        return $false
+    }
+}
+
+<#
+.SYNOPSIS
+    Create or remove the hidden logon task that starts AutoVPN.
+.DESCRIPTION
+    Replaces the old Startup-folder shortcut, which flashed a console window and
+    pointed at app.bat's hardcoded path. A scheduled task starts hidden, runs in
+    the interactive session (required - SVPClient's windows do not exist in
+    session 0), and is easier to inspect and remove.
+
+    Registered for the current user only, at their own privilege level. It is
+    NOT "run whether logged on or not": the automation drives a GUI application
+    and needs a real desktop.
+
+    Removes a leftover Startup shortcut from earlier versions so the two cannot
+    both fire.
+#>
 function Set-AutoStart {
     param([bool]$Enable)
 
-    $startupFolder = [Environment]::GetFolderPath("Startup")
-    $shortcutPath = Join-Path $startupFolder "AutoVPN.lnk"
+    # Earlier versions used a Startup-folder shortcut. Clear it either way, so
+    # enabling the task never leaves two launchers racing each other.
+    $legacyShortcut = Join-Path ([Environment]::GetFolderPath("Startup")) "AutoVPN.lnk"
+    if (Test-Path $legacyShortcut) {
+        try {
+            Remove-Item $legacyShortcut -Force
+            Write-Log "Removed old Startup shortcut (replaced by scheduled task)" "Yellow"
+        } catch {
+            Write-Log "Could not remove old Startup shortcut: $($_.Exception.Message)" "Yellow"
+        }
+    }
 
-    if ($Enable) {
-        $batPath = Join-Path $Script:ScriptDir "app.bat"
-        if (Test-Path $batPath) {
-            $shell = New-Object -ComObject WScript.Shell
-            $shortcut = $shell.CreateShortcut($shortcutPath)
-            $shortcut.TargetPath = $batPath
-            $shortcut.WorkingDirectory = $Script:ScriptDir
-            $shortcut.WindowStyle = 7  # Minimized
-            $shortcut.Description = "AutoVPN - Auto-connect VPN"
-            $shortcut.Save()
-            Write-Log "Auto-start enabled (shortcut created)" "Green"
+    if (-not $Enable) {
+        try {
+            if (Test-AutoStart) {
+                Unregister-ScheduledTask -TaskName $Script:TaskName -Confirm:$false -ErrorAction Stop
+                Write-Log "Auto-start disabled (task removed)" "Yellow"
+            }
+        } catch {
+            Write-Log "Could not remove auto-start task: $($_.Exception.Message)" "Red"
         }
-    } else {
-        if (Test-Path $shortcutPath) {
-            Remove-Item $shortcutPath -Force
-            Write-Log "Auto-start disabled (shortcut removed)" "Yellow"
+        return
+    }
+
+    $cmd = Get-AutoStartCommand
+    if (-not $cmd) {
+        Write-Log "Auto-start not enabled: neither AutoVPN.exe nor AutoVPN.ps1 found in $Script:ScriptDir" "Red"
+        return
+    }
+
+    try {
+        $action = if ($cmd.Arguments) {
+            New-ScheduledTaskAction -Execute $cmd.Path -Argument $cmd.Arguments -WorkingDirectory $Script:ScriptDir
+        } else {
+            New-ScheduledTaskAction -Execute $cmd.Path -WorkingDirectory $Script:ScriptDir
         }
+
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+
+        # Hidden, and none of the defaults that would stop a long-running tray
+        # app: no execution time limit, do not stop on battery, do not refuse to
+        # start on battery.
+        $settings = New-ScheduledTaskSettingsSet -Hidden `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -StartWhenAvailable
+
+        # Interactive: the automation drives SVPClient's windows, which only
+        # exist on the logged-on user's desktop.
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+            -LogonType Interactive -RunLevel Limited
+
+        Register-ScheduledTask -TaskName $Script:TaskName `
+            -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
+            -Description "Starts AutoVPN at logon, hidden. Created by AutoVPN Settings." `
+            -Force -ErrorAction Stop | Out-Null
+
+        Write-Log "Auto-start enabled (hidden logon task '$($Script:TaskName)')" "Green"
+    } catch {
+        Write-Log "Could not create auto-start task: $($_.Exception.Message)" "Red"
+        Write-Log "Task creation can require permission your account may not have" "Yellow"
     }
 }
 #endregion
@@ -1805,6 +1938,25 @@ $Script:TraySettings   = $ui.TraySettings
     }
 
     [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    # PS2EXE does not feed arguments into param(), so a compiled build never sees
+    # $Background. Fall back to the raw command line, which is correct for both.
+    $wantBackground = $Background -or ([Environment]::CommandLine -match '(?i)(^|\s)[-/]Background(\s|$)')
+
+    if ($wantBackground) {
+        # Started by the logon task: live in the tray, show no window. The form
+        # still has to exist - it owns the tray icon and is what Invoke-OnUI
+        # marshals through - so it is created and immediately hidden.
+        Write-Log "Started in background mode (tray only)" "Cyan"
+        $form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+        $form.ShowInTaskbar = $false
+        # Hide via the captured $form, not $Script:MainForm: inside an event
+        # handler that name resolves against the handler's own scope, which is
+        # the same trap the Invoke-OnUI closures hit.
+        $bgForm = $form
+        $form.Add_Shown({ $bgForm.Hide() }.GetNewClosure())
+    }
+
     [System.Windows.Forms.Application]::Run($form)
 }
 
@@ -1812,13 +1964,18 @@ $Script:TraySettings   = $ui.TraySettings
 if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
     Write-Host "[WARN] Not in STA mode - restarting in STA..." -ForegroundColor Yellow
     $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    # Carry our own switches across the relaunch. Without this, a run started by
+    # the logon task would lose -Background and pop a window at every logon.
+    $passthru = if ($Background -or ([Environment]::CommandLine -match '(?i)(^|\s)[-/]Background(\s|$)')) { " -Background" } else { "" }
+
     if ($exePath -match 'powershell\.exe$|pwsh\.exe$') {
         # Running as .ps1 - relaunch with -STA
         $scriptPath = $MyInvocation.MyCommand.Definition
-        Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$scriptPath`""
+        Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$scriptPath`"$passthru"
     } else {
         # Running as .exe - relaunch self
-        Start-Process -FilePath $exePath
+        if ($passthru) { Start-Process -FilePath $exePath -ArgumentList $passthru.Trim() }
+        else           { Start-Process -FilePath $exePath }
     }
     exit
 }
