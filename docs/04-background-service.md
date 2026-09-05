@@ -257,6 +257,20 @@ The lesson worth keeping: the measurement said "a window is visible", and that
 was read as "the form failed to hide". Enumerating *which* window it was would
 have found this immediately.
 
+### Background mode does not open Settings
+
+If no credentials are stored, a normal launch opens the Settings dialog so the
+user can enter them. Under `-Background` that is wrong: the app is meant to be
+invisible, and a modal dialog nobody asked for defeats the point — it was found
+in testing as a visible `AutoVPN Settings` window after a logon-task run on a
+machine with no `vpn_cred.dat`.
+
+In background mode the app now logs `configure via the tray icon` and stays
+hidden. The user opens Settings from the tray when they are ready.
+
+`$wantBackground` is therefore computed **before** the credentials check rather
+than just before the window is hidden.
+
 ### Auto-start is now its own setting
 
 The Settings dialog previously had one checkbox, "Auto-connect when program

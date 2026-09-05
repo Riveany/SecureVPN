@@ -1912,18 +1912,31 @@ $Script:TraySettings   = $ui.TraySettings
     Write-Log "AutoVPN v2.0 started" "Cyan"
     Write-Log "Network: $($Script:Config.connection_name)" "White"
 
+    # Read the switch, and fall back to the raw command line. Both work in a
+    # PS2EXE build - measured - so this is belt and braces rather than a
+    # workaround. Determined here because the credentials check below needs it.
+    $wantBackground = $Background -or ([Environment]::CommandLine -match '(?i)(^|\s)[-/]Background(\s|$)')
+
     # Check if credentials exist
     if (-not (Test-VpnCredential)) {
-        Write-Log "No credentials found - opening Settings..." "Yellow"
-        # Use timer to show settings after form is shown
-        $timer = New-Object System.Windows.Forms.Timer
-        $timer.Interval = 500
-        $timer.Add_Tick({
-            $timer.Stop()
-            $timer.Dispose()
-            Show-SettingsDialog
-        })
-        $timer.Start()
+        if ($wantBackground) {
+            # Started by the logon task with nothing configured. Opening a modal
+            # Settings dialog nobody asked for would defeat the point of running
+            # hidden, so sit in the tray and let the user open Settings when they
+            # are ready.
+            Write-Log "No credentials found - configure via the tray icon" "Yellow"
+        } else {
+            Write-Log "No credentials found - opening Settings..." "Yellow"
+            # Use timer to show settings after form is shown
+            $timer = New-Object System.Windows.Forms.Timer
+            $timer.Interval = 500
+            $timer.Add_Tick({
+                $timer.Stop()
+                $timer.Dispose()
+                Show-SettingsDialog
+            })
+            $timer.Start()
+        }
     } else {
         Write-Log "Credentials loaded" "Green"
 
@@ -1948,11 +1961,6 @@ $Script:TraySettings   = $ui.TraySettings
     }
 
     [System.Windows.Forms.Application]::EnableVisualStyles()
-
-    # Read the switch, and fall back to the raw command line. Both work in a
-    # PS2EXE build - measured - so this is belt and braces rather than a
-    # workaround.
-    $wantBackground = $Background -or ([Environment]::CommandLine -match '(?i)(^|\s)[-/]Background(\s|$)')
 
     if ($wantBackground) {
         # Started by the logon task: live in the tray, show no window. The form

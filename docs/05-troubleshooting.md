@@ -198,6 +198,13 @@ Use `Write-Log` (or `[Console]::WriteLine`) instead. Check with:
 Select-String -Path AutoVPN.ps1 -Pattern 'Write-Host'
 ```
 
+## Auto-start runs but nothing seems to happen on a new machine
+
+Expected when no credentials are stored yet. In background mode the app stays
+hidden rather than opening Settings, and logs `No credentials found - configure
+via the tray icon`. Open Settings from the tray icon and enter them once;
+credentials cannot be copied between machines (DPAPI is per user, per machine).
+
 ## A window appears at logon instead of starting to tray
 
 Check the task passes `-Background`:
