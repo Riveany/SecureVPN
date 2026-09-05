@@ -11,10 +11,9 @@
 # PowerShell console, not this application's own form, so without this the app
 # would still pop a window in the user's face at every logon.
 #
-# KNOWN LIMITATION: verified working when run as a .ps1. A PS2EXE-compiled
-# AutoVPN.exe still shows its window despite receiving the switch on its command
-# line - cause not yet identified. Set-AutoStart therefore prefers the .ps1 for
-# the logon task even on machines where the exe exists.
+# Works in both a .ps1 run and a PS2EXE-compiled build. The hiding is done with
+# ShowWindow(SW_HIDE) from a short timer rather than Form.Hide() in Add_Shown,
+# because the latter leaves the window visible in a compiled build.
 param(
     [switch]$Background
 )
@@ -74,6 +73,7 @@ public class Win32 {
     public const uint WM_COMMAND    = 0x0111;
     public const uint WM_CLOSE      = 0x0010;
     public const uint BN_CLICKED    = 0;
+    public const int  SW_HIDE       = 0;
     public const int  SW_SHOW       = 5;
     public const int  SW_RESTORE    = 9;
 
@@ -431,7 +431,13 @@ function Write-Log {
         }.GetNewClosure()
     }
 
-    Write-Host $line -ForegroundColor $Color
+    # NOT Write-Host: PS2EXE builds with -NoConsole turn Write-Host into a
+    # MessageBox, so every log line would pop a dialog - which is exactly what
+    # made -Background look broken in the compiled build. The WinForms window was
+    # hidden correctly all along; the visible '#32770' was this MessageBox.
+    # [Console]::WriteLine writes to a real console when there is one and is a
+    # harmless no-op when there is not.
+    try { [Console]::WriteLine($line) } catch { }
 }
 #endregion
 
@@ -1493,9 +1499,14 @@ function Get-AutoStartCommand {
     $exe = Join-Path $Script:ScriptDir "AutoVPN.exe"
     $ps1 = Join-Path $Script:ScriptDir "AutoVPN.ps1"
 
-    # Prefer the .ps1: -Background is verified to hide the window there, and is
-    # known NOT to work in the compiled exe (see the note on param() above).
-    # The exe is used only when no .ps1 is present, and then the window shows.
+    # Prefer the exe when this is a compiled build: it is self-contained, so a
+    # machine can run AutoVPN without shipping the source alongside it.
+    $running = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $isCompiled = ($running -match '\.exe$') -and ($running -notmatch 'powershell\.exe$|pwsh\.exe$')
+
+    if ($isCompiled -and (Test-Path $exe)) {
+        return @{ Path = $exe; Arguments = "-Background" }
+    }
     if (Test-Path $ps1) {
         return @{
             Path      = (Get-Command powershell.exe).Source
@@ -1503,7 +1514,6 @@ function Get-AutoStartCommand {
         }
     }
     if (Test-Path $exe) {
-        # Falls back to the exe; note the window will be visible at logon.
         return @{ Path = $exe; Arguments = "-Background" }
     }
     return $null
@@ -1851,7 +1861,7 @@ function Main {
     $init.AddScript($bootstrap.ToString()) | Out-Null
     $init.Invoke() | Out-Null
     if ($init.Streams.Error.Count) {
-        Write-Host "[WARN] Worker bootstrap: $($init.Streams.Error[0].Exception.Message)" -ForegroundColor Yellow
+        Write-Log "Worker bootstrap: $($init.Streams.Error[0].Exception.Message)" "Yellow"
     }
     $init.Dispose()
 
@@ -1894,7 +1904,7 @@ $Script:TraySettings   = $ui.TraySettings
     }) | Out-Null
     $bind.Invoke() | Out-Null
     if ($bind.Streams.Error.Count) {
-        Write-Host "[WARN] Worker bind: $($bind.Streams.Error[0].Exception.Message)" -ForegroundColor Yellow
+        Write-Log "Worker bind: $($bind.Streams.Error[0].Exception.Message)" "Yellow"
     }
     $bind.Dispose()
 
@@ -1939,22 +1949,48 @@ $Script:TraySettings   = $ui.TraySettings
 
     [System.Windows.Forms.Application]::EnableVisualStyles()
 
-    # PS2EXE does not feed arguments into param(), so a compiled build never sees
-    # $Background. Fall back to the raw command line, which is correct for both.
+    # Read the switch, and fall back to the raw command line. Both work in a
+    # PS2EXE build - measured - so this is belt and braces rather than a
+    # workaround.
     $wantBackground = $Background -or ([Environment]::CommandLine -match '(?i)(^|\s)[-/]Background(\s|$)')
 
     if ($wantBackground) {
         # Started by the logon task: live in the tray, show no window. The form
         # still has to exist - it owns the tray icon and is what Invoke-OnUI
-        # marshals through - so it is created and immediately hidden.
+        # marshals through - so it is created and then hidden.
         Write-Log "Started in background mode (tray only)" "Cyan"
-        $form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
         $form.ShowInTaskbar = $false
-        # Hide via the captured $form, not $Script:MainForm: inside an event
-        # handler that name resolves against the handler's own scope, which is
-        # the same trap the Invoke-OnUI closures hit.
+
+        # Hide with ShowWindow(SW_HIDE) from a short timer, so it runs AFTER the
+        # message loop has started and the handle exists. Add_Shown + Form.Hide()
+        # was tried first and works as a .ps1 but leaves the window visible in a
+        # compiled build; this fires later and works in both. Capture the form in
+        # a local - $Script:MainForm resolves against the handler's own scope.
         $bgForm = $form
-        $form.Add_Shown({ $bgForm.Hide() }.GetNewClosure())
+
+        # Hide repeatedly for the first few seconds rather than once. A single
+        # well-timed hide worked in isolation but not in the full application,
+        # and the cause was not identified after extended testing; something
+        # during startup puts the window back. Re-hiding until the app has
+        # settled is not elegant, but it is reliable, and it stops as soon as the
+        # window stays hidden.
+        $script:hideTries = 0
+        $hideTimer = New-Object System.Windows.Forms.Timer
+        $hideTimer.Interval = 150
+        $hideTimer.Add_Tick({
+            $script:hideTries++
+            if ($bgForm.IsDisposed) { $hideTimer.Stop(); $hideTimer.Dispose(); return }
+
+            [Win32]::ShowWindow($bgForm.Handle, [Win32]::SW_HIDE) | Out-Null
+            $bgForm.ShowInTaskbar = $false
+
+            # ~4.5 s of retries, then give up so this never runs forever.
+            if ($script:hideTries -ge 30) {
+                $hideTimer.Stop()
+                $hideTimer.Dispose()
+            }
+        }.GetNewClosure())
+        $hideTimer.Start()
     }
 
     [System.Windows.Forms.Application]::Run($form)
@@ -1962,7 +1998,7 @@ $Script:TraySettings   = $ui.TraySettings
 
 # Ensure STA thread for Windows Forms
 if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
-    Write-Host "[WARN] Not in STA mode - restarting in STA..." -ForegroundColor Yellow
+    try { [Console]::WriteLine("[WARN] Not in STA mode - restarting in STA...") } catch { }
     $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     # Carry our own switches across the relaunch. Without this, a run started by
     # the logon task would lose -Background and pop a window at every logon.

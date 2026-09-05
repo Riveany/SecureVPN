@@ -225,17 +225,37 @@ targets whichever launcher actually sits beside it.
 `-WindowStyle Hidden` suppresses the **PowerShell console**, not the
 application's own window. Without more, a logon task would still put a window in
 the user's face. The script therefore takes a `-Background` switch that starts it
-minimised, out of the taskbar, and hidden on `Shown` — tray only.
+with `ShowInTaskbar = $false` and hides the form via `ShowWindow(SW_HIDE)` from a
+short timer, once the message loop is running and the handle exists.
 
-**Known limitation, verified:** `-Background` works when AutoVPN runs as a
-`.ps1`. A PS2EXE-compiled `AutoVPN.exe` still shows its window despite receiving
-the switch on its command line; the cause was not identified. A minimal PS2EXE
-probe *did* receive the switch correctly into `param()`, so it is something about
-this script's startup rather than PS2EXE argument passing in general.
+Works in both a `.ps1` run and a PS2EXE build, so `AutoVPN.exe` is self-contained
+— a machine can run AutoVPN without the source beside it.
 
-Because of that, `Get-AutoStartCommand` prefers the `.ps1` for the logon task
-even when the exe is present, and falls back to the exe only if no `.ps1` exists
-— in which case the window will be visible at logon.
+### The bug that made this look impossible
+
+`-Background` appeared broken in compiled builds for a long stretch of debugging:
+the window kept appearing even though the switch was received. Five plausible
+explanations were tested and disproved — that PS2EXE drops `param()` arguments,
+that `param()` does not work in a compiled build, that the exe cannot hide a
+form, that the tray icon or resize handler interfered, and that compilation was
+incomplete. Isolated probes reproducing each condition all hid correctly.
+
+Enumerating the process's actual windows settled it. The WinForms form **was**
+hidden (`vis=False`); the visible window was a separate `#32770` dialog whose
+only children were an `OK` button and a static label reading
+`[00:55:03] AutoVPN v2.0 started`.
+
+`Write-Log` ended with `Write-Host`. **PS2EXE with `-NoConsole` turns `Write-Host`
+into a MessageBox**, so every log line popped a modal dialog. The first one
+appeared during startup and was what the user saw.
+
+`Write-Log` now uses `[Console]::WriteLine` in a `try`, which writes to a real
+console when one exists and is harmless when there is not. The three other
+`Write-Host` calls were replaced too.
+
+The lesson worth keeping: the measurement said "a window is visible", and that
+was read as "the form failed to hide". Enumerating *which* window it was would
+have found this immediately.
 
 ### Auto-start is now its own setting
 

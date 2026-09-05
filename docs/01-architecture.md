@@ -24,7 +24,7 @@ navigate it.
 | `[2] Global Variables` | 234–289 | Script directory detection, `$Script:`-scoped state, the worker handles, and `$Script:Shared` |
 | `[3] Config Management` | 291–323 | Loads, creates, and saves `config.json`; resolves the credential file path |
 | `[4] Credential Management` | 325–374 | DPAPI encrypt/decrypt of the VPN username and password |
-| `[5] Logging` | 376–436 | `Invoke-OnUI` (the UI-thread marshaller) and `Write-Log` |
+| `[5] Logging` | 376–440 | `Invoke-OnUI` (the UI-thread marshaller) and `Write-Log` |
 | `[6] VPN Automation Engine` | 438–1227 | The connect and disconnect cores, their helpers, the cancellation checks, and the worker dispatchers |
 | `[7] UI State Management` | 1229–1267 | `Update-UIState` — the single place that sets status text, colour, and button enablement |
 | `[8] Settings Dialog` | 1269–1475 | Modal dialog for credentials, connection name, auto-connect, auto-start, and tray behaviour |
@@ -48,7 +48,7 @@ The application has **two threads**: the Windows Forms UI thread, and a worker
 that runs the VPN automation.
 
 `Main` ends with `[System.Windows.Forms.Application]::Run($form)`
-([AutoVPN.ps1:1960](../AutoVPN.ps1)), which starts the message loop on the UI
+([AutoVPN.ps1:1996](../AutoVPN.ps1)), which starts the message loop on the UI
 thread. Before that it creates `$Script:WorkerRunspace` — an STA runspace that
 every connect and disconnect runs on.
 
@@ -157,7 +157,7 @@ and fail to find `config.json`.
 
 Windows Forms requires a single-threaded apartment. The entry point checks the
 current thread's apartment state and, if it is not STA, relaunches itself with
-the correct flag and exits ([AutoVPN.ps1:1964](../AutoVPN.ps1)). The relaunch
+the correct flag and exits ([AutoVPN.ps1:2000](../AutoVPN.ps1)). The relaunch
 path differs for script and executable, mirroring the directory detection above.
 
 This is why [`app.bat`](../app.bat) passes `-STA` explicitly — it avoids the

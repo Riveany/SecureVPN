@@ -18,7 +18,7 @@ startup by `Load-Config`, so the application must be restarted after editing.
 ## `ERROR: Failed to start SVPClient`
 
 The executable was launched but no process named `SVPClient` existed 3 seconds
-later ([AutoVPN.ps1:462](../AutoVPN.ps1)).
+later ([AutoVPN.ps1:468](../AutoVPN.ps1)).
 
 Usual causes: the client requires elevation it did not receive, or it crashed on
 startup. Launch `SVPClient.exe` by hand and observe what happens.
@@ -36,7 +36,7 @@ Check in order:
 2. Has the client version changed the window title? Compare the actual title
    against the substring in [03-win32-reference.md](03-win32-reference.md).
 3. Was the client slower than 15 seconds to show its window? The timeout is a
-   parameter default at [AutoVPN.ps1:466](../AutoVPN.ps1).
+   parameter default at [AutoVPN.ps1:472](../AutoVPN.ps1).
 
 ## `ERROR: Could not find Login button (ID: 1018)`
 
@@ -59,7 +59,7 @@ The certificate dialog appeared but none of the three lookups matched: control
 ID 6.
 
 `Handle-SecurityAlert` logs every button it found, with ID and text, immediately
-after this warning ([AutoVPN.ps1:576](../AutoVPN.ps1)). Read those lines — they
+after this warning ([AutoVPN.ps1:582](../AutoVPN.ps1)). Read those lines — they
 contain what is needed to fix the matcher, and the new ID belongs in
 `ID_SECALERT_YES`.
 
@@ -67,7 +67,7 @@ contain what is needed to fix the matcher, and the new ID belongs in
 
 Reached only when the verified control IDs 1012 and 1219 are both absent, so
 `Fill-AuthForm` fell back to positional mapping and then found fewer than two
-`Edit` controls ([AutoVPN.ps1:627](../AutoVPN.ps1)).
+`Edit` controls ([AutoVPN.ps1:633](../AutoVPN.ps1)).
 
 The dialog layout has changed. The function logs every `Edit` and `Button` with
 its ID and text before this error, so the log shows the new structure — update
@@ -96,7 +96,7 @@ still succeed, but the IDs should be re-checked against the current client — s
 ## `WARNING: Login screen reappeared - connection may have failed`
 
 `Test-VpnConnected` saw the login window return more than 10 seconds after the
-credentials were submitted ([AutoVPN.ps1:752](../AutoVPN.ps1)). This is the
+credentials were submitted ([AutoVPN.ps1:758](../AutoVPN.ps1)). This is the
 signature of rejected credentials.
 
 Open Settings and re-enter them. Note that credentials are stored per user and
@@ -114,7 +114,7 @@ Get-NetAdapter | Where-Object InterfaceDescription -like "*VPN*" | Format-Table 
 ```
 
 The detection filter matches `*VMware SSL VPN*` or `*SSL VPN-Plus*` against
-`InterfaceDescription` ([AutoVPN.ps1:713](../AutoVPN.ps1)). A different adapter
+`InterfaceDescription` ([AutoVPN.ps1:719](../AutoVPN.ps1)). A different adapter
 description will never match, and the fallback heuristic will not help while the
 login window is visible.
 
@@ -122,7 +122,7 @@ login window is visible.
 
 The elevated `taskkill` failed. Most commonly the user dismissed the UAC prompt,
 in which case `Process.Start` throws and the UI is set back to `Connected`
-([AutoVPN.ps1:1066](../AutoVPN.ps1)).
+([AutoVPN.ps1:1072](../AutoVPN.ps1)).
 
 Disconnect always requires elevation, because SVPClient is protected by the
 `NeoSrv` service. There is no way to avoid the prompt with the current approach.
@@ -142,7 +142,7 @@ Get-Service NeoSrv
 
 `Test-VpnConnectedNow` has a heuristic fallback that reports connected whenever
 an `SVPClient` process exists and no login window is visible
-([AutoVPN.ps1:728](../AutoVPN.ps1)). It fires during the interval between the
+([AutoVPN.ps1:734](../AutoVPN.ps1)). It fires during the interval between the
 client starting and its login dialog appearing, and whenever the adapter query
 throws.
 
@@ -187,16 +187,33 @@ Get-ScheduledTaskInfo -TaskName AutoVPN | Select-Object LastRunTime, LastTaskRes
 correct for a tray app. A missing task means the checkbox was never ticked, or
 registration failed — `Set-AutoStart` logs the reason.
 
+## A dialog with an OK button appears, showing a single log line
+
+A `Write-Host` reached a PS2EXE `-NoConsole` build, which renders it as a
+MessageBox rather than console output. Every such call pops a modal dialog.
+
+Use `Write-Log` (or `[Console]::WriteLine`) instead. Check with:
+
+```powershell
+Select-String -Path AutoVPN.ps1 -Pattern 'Write-Host'
+```
+
 ## A window appears at logon instead of starting to tray
 
-Expected if the task runs `AutoVPN.exe`. `-Background` is verified working for
-the `.ps1` but not for the compiled build — see
-[04-background-service.md](04-background-service.md). Keep `AutoVPN.ps1` beside
-the exe and `Get-AutoStartCommand` will prefer it.
+Check the task passes `-Background`:
+
+```powershell
+(Get-ScheduledTask -TaskName AutoVPN).Actions[0].Arguments
+```
+
+If it does, look for a stray `Write-Host` per the entry above — the visible
+window may be a MessageBox rather than the application form. Enumerate the
+process's windows to see which it is; the form's class begins with
+`WindowsForms10`, a MessageBox is `#32770`.
 
 ## Settings do not take effect
 
-`Load-Config` runs once, at the start of `Main` ([AutoVPN.ps1:1820](../AutoVPN.ps1)).
+`Load-Config` runs once, at the start of `Main` ([AutoVPN.ps1:1830](../AutoVPN.ps1)).
 Editing `config.json` by hand while the application is running has no effect
 until restart. Changes made through the Settings dialog are written and applied
 in-process.
@@ -209,7 +226,7 @@ Two things to check:
    elsewhere, the launcher points at a file that does not exist and PowerShell
    exits silently because the console window is hidden.
 2. The script requires STA. The entry point relaunches itself if the apartment
-   state is wrong ([AutoVPN.ps1:1964](../AutoVPN.ps1)); if that relaunch loops,
+   state is wrong ([AutoVPN.ps1:2000](../AutoVPN.ps1)); if that relaunch loops,
    the executable-versus-script detection is misfiring.
 
 To see the error, run without the hidden window:
@@ -219,4 +236,4 @@ powershell -ExecutionPolicy Bypass -STA -File "D:\SecureVPN\AutoVPN.ps1"
 ```
 
 Any unhandled exception in `Main` is also shown in a message box with a stack
-trace ([AutoVPN.ps1:1988](../AutoVPN.ps1)).
+trace ([AutoVPN.ps1:2024](../AutoVPN.ps1)).
