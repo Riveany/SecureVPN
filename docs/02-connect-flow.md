@@ -2,7 +2,7 @@
 
 ## Connect: the seven steps
 
-`Connect-VPN` ([AutoVPN.ps1:775](../AutoVPN.ps1)) runs a fixed seven-step
+`Connect-VPN` ([AutoVPN.ps1:781](../AutoVPN.ps1)) runs a fixed seven-step
 sequence. Each step logs a `Step N:` line, so the activity log maps directly
 onto this document.
 
@@ -13,7 +13,7 @@ and the user is told to open Settings.
 
 ### Step 1 — Start SVPClient
 
-`Start-SVPClient` ([AutoVPN.ps1:370](../AutoVPN.ps1)) launches the executable at
+`Start-SVPClient` ([AutoVPN.ps1:373](../AutoVPN.ps1)) launches the executable at
 `$Script:Config.vpn_client_path`, waits 3 seconds, then confirms a process named
 `SVPClient` exists. If the process is already running, the function returns
 early without launching a second copy.
@@ -22,7 +22,7 @@ Followed by a 2-second `DoEvents-Sleep`.
 
 ### Step 2 — Find the Login window
 
-`Find-SVPLoginWindow` ([AutoVPN.ps1:397](../AutoVPN.ps1)) polls every 500 ms for
+`Find-SVPLoginWindow` ([AutoVPN.ps1:400](../AutoVPN.ps1)) polls every 500 ms for
 up to 15 seconds, looking for a visible window whose title contains
 `SSL VPN-Plus Client - Login`.
 
@@ -33,20 +33,24 @@ short-circuits the whole sequence if the adapter is already reporting `Up`.
 
 ### Step 3 — Click Login
 
-`Click-LoginButton` ([AutoVPN.ps1:432](../AutoVPN.ps1)) calls
-`ShowWindow(SW_RESTORE)` on the login window, waits 300 ms, then clicks control
-ID **1018** via `Win32::ClickButton`.
+`Click-LoginButton` ([AutoVPN.ps1:435](../AutoVPN.ps1)) clicks control ID
+**1018** via `Win32::ClickButton`. It does nothing else — no restore, no raise,
+no focus change.
 
-The `ShowWindow` call is the one place in the connect flow that deliberately
-changes window z-order. It is not required for `BM_CLICK` to work and is a
-contributing factor to the interference described in
-[04-background-service.md](04-background-service.md).
+It previously called `ShowWindow(SW_RESTORE)` first, with a 300 ms wait. That
+was removed: `BM_CLICK` is delivered to the control's message queue and does not
+require the window to be visible, restored, or focused. Verified by minimising
+the login window deliberately and clicking Login anyway — the Security Alert
+appeared, and the foreground window did not change.
+
+Restoring the window only pulled SVPClient in front of whatever the user was
+doing, and put a clickable window on screen mid-sequence.
 
 Followed by a 2-second `DoEvents-Sleep`.
 
 ### Step 4 — Handle the Security Alert
 
-`Handle-SecurityAlert` ([AutoVPN.ps1:450](../AutoVPN.ps1)) polls for up to 10
+`Handle-SecurityAlert` ([AutoVPN.ps1:456](../AutoVPN.ps1)) polls for up to 10
 seconds for a window titled `Security Alert`. This is the certificate-trust
 dialog and does not always appear; its absence is not an error.
 
@@ -61,7 +65,7 @@ Followed by a 1-second `DoEvents-Sleep`.
 
 ### Step 5 — Find the Authentication window
 
-`Find-AuthWindow` ([AutoVPN.ps1:519](../AutoVPN.ps1)) polls for up to 20 seconds
+`Find-AuthWindow` ([AutoVPN.ps1:525](../AutoVPN.ps1)) polls for up to 20 seconds
 for a window titled `User Authentication`.
 
 Two additional behaviours are folded into this loop:
@@ -74,7 +78,7 @@ Two additional behaviours are folded into this loop:
 
 ### Step 6 — Fill the authentication form
 
-`Fill-AuthForm` ([AutoVPN.ps1:555](../AutoVPN.ps1)) enumerates all child controls
+`Fill-AuthForm` ([AutoVPN.ps1:561](../AutoVPN.ps1)) enumerates all child controls
 of the auth dialog and partitions them into `Edit` and `Button` lists, logging
 each one's ID and text.
 
@@ -100,7 +104,7 @@ during which the plaintext password is resident in memory.
 ### Step 7 — Verify
 
 After a 3-second `DoEvents-Sleep`, `Test-VpnConnected`
-([AutoVPN.ps1:664](../AutoVPN.ps1)) polls for up to 30 seconds. It succeeds as
+([AutoVPN.ps1:670](../AutoVPN.ps1)) polls for up to 30 seconds. It succeeds as
 soon as `Test-VpnConnectedNow` returns true. It fails early if the Login window
 reappears after the first 10 seconds, which indicates rejected credentials.
 
@@ -115,7 +119,7 @@ exceptions.
 
 ## How connection state is detected
 
-`Test-VpnConnectedNow` ([AutoVPN.ps1:637](../AutoVPN.ps1)) is the single source
+`Test-VpnConnectedNow` ([AutoVPN.ps1:643](../AutoVPN.ps1)) is the single source
 of truth for "is the VPN up", and it is called from many places. It uses two
 checks in order:
 
@@ -134,10 +138,10 @@ suspicion.
 
 ## Disconnect
 
-`Disconnect-VPN` ([AutoVPN.ps1:944](../AutoVPN.ps1)) does not use the client's
+`Disconnect-VPN` ([AutoVPN.ps1:950](../AutoVPN.ps1)) does not use the client's
 own disconnect button. It kills the process.
 
-The reason is stated in a comment at [AutoVPN.ps1:977](../AutoVPN.ps1):
+The reason is stated in a comment at [AutoVPN.ps1:983](../AutoVPN.ps1):
 `SVPClient` is protected by the `NeoSrv` service and cannot be terminated
 without elevation.
 
@@ -170,7 +174,7 @@ Connect-VPN
   ├─ Load-VpnCredential ──────────── abort if absent
   ├─ 1. Start-SVPClient              (3 s wait, verify process)
   ├─ 2. Find-SVPLoginWindow          (poll 15 s) ─── may short-circuit to Connected
-  ├─ 3. Click-LoginButton            (ShowWindow + BM_CLICK id 1018)
+  ├─ 3. Click-LoginButton            (BM_CLICK id 1018, no window raise)
   ├─ 4. Handle-SecurityAlert         (poll 10 s, optional dialog)
   ├─ 5. Find-AuthWindow              (poll 20 s) ─── may return -1 = already connected
   ├─ 6. Fill-AuthForm                (WM_SETTEXT ×2, BM_CLICK OK)

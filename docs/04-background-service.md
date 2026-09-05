@@ -32,7 +32,7 @@ This is the primary one.
 `Connect-VPN` runs on the same thread as the Windows Forms message loop. To keep
 the window responsive during its long waits, it repeatedly calls
 `[System.Windows.Forms.Application]::DoEvents()` — directly between steps, and
-inside `DoEvents-Sleep` ([AutoVPN.ps1:723](../AutoVPN.ps1)), which is invoked
+inside `DoEvents-Sleep` ([AutoVPN.ps1:729](../AutoVPN.ps1)), which is invoked
 from 23 places including every polling loop.
 
 `DoEvents()` dispatches all pending Windows messages. That includes user input.
@@ -50,7 +50,7 @@ authentication window belonging to a process that no longer exists — until its
 UI state that `Disconnect-VPN` just set.
 
 `Update-UIState` itself ends with a `DoEvents()` call
-([AutoVPN.ps1:1100](../AutoVPN.ps1)), so even a routine status update inside the
+([AutoVPN.ps1:1106](../AutoVPN.ps1)), so even a routine status update inside the
 sequence is a re-entrancy point.
 
 ## Cause 2 — the guards cover the buttons but not the tray (FIXED)
@@ -101,6 +101,24 @@ clean stack. The two sequences can never be on the stack at once.
 
 Verified live: cancel at step 4 unwound in 0.1 s, the disconnect then ran to
 completion, and both flags were clear afterwards.
+
+## Cause 3 — the flow raised the SVPClient window (FIXED)
+
+`Click-LoginButton` called `ShowWindow(SW_RESTORE)` on the login window before
+clicking it, with a 300 ms wait.
+
+`BM_CLICK` never needed this. The call restored a minimised window and pulled it
+forward, which meant the connect sequence visibly disturbed whatever the user was
+doing — and put a clickable window on screen at exactly the moment cause 1 made
+stray clicks dangerous.
+
+Removed, after verifying the click works without it: with the login window
+deliberately minimised (`SW_MINIMIZE`, `IsIconic` confirmed true), `BM_CLICK` on
+control 1018 still reached the client and the Security Alert appeared. The
+foreground window handle was identical before and after. A full seven-step
+connect then ran to completion with the window minimised throughout.
+
+The automation now never restores, raises, or focuses an SVPClient window.
 
 ## Options for background operation
 
@@ -157,7 +175,7 @@ window suppressed or started directly to the tray.
 
 This runs in the interactive session, so window automation works. It removes the
 visible window that invites the stray click, and it replaces the Startup-folder
-shortcut created by `Set-AutoStart` ([AutoVPN.ps1:1300](../AutoVPN.ps1)) with
+shortcut created by `Set-AutoStart` ([AutoVPN.ps1:1306](../AutoVPN.ps1)) with
 something more controllable.
 
 It is a mitigation, not a fix. The re-entrancy in cause 1 is still present; there
@@ -222,11 +240,12 @@ Done:
   `ES_PASSWORD` check that aborts rather than typing the password into a
   visible field.
 
-Still open:
+- **`ShowWindow(SW_RESTORE)` removed from `Click-LoginButton`** (cause 3 above).
+  Verified first: with the login window deliberately minimised, `BM_CLICK` still
+  reached it and the Security Alert appeared, with the foreground window
+  unchanged. The automation now never restores or raises an SVPClient window.
 
-- **Drop the `ShowWindow(SW_RESTORE)` in `Click-LoginButton`** (cause 3).
-  `BM_CLICK` does not need it, and it pulls the client's window forward for no
-  benefit. Verify against the client before removing.
+Nothing outstanding from this list.
 
 ## Verifying a fix
 

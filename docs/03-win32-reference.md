@@ -38,7 +38,7 @@ Region 1 compiles an inline C# class via `Add-Type`. PowerShell then calls it as
 | `SendMessage` (two overloads) | Synchronous message send; the `string` overload carries `WM_SETTEXT` payloads |
 | `PostMessage` | Asynchronous message post; used as the `WM_COMMAND` fallback |
 | `SetForegroundWindow` | Raising the AutoVPN window itself from the tray |
-| `ShowWindow` | Restoring the SVPClient login window before clicking |
+| `ShowWindow` | Declared but unused — the automation never restores or raises SVPClient's windows |
 
 ### Message constants
 
@@ -51,8 +51,8 @@ Region 1 compiles an inline C# class via `Add-Type`. PowerShell then calls it as
 | `WM_COMMAND` | `0x0111` | Notification to a parent; used for the click fallback |
 | `WM_CLOSE` | `0x0010` | Request a window close |
 | `BN_CLICKED` | `0` | Notification code packed into the `WM_COMMAND` fallback |
-| `SW_SHOW` | `5` | `ShowWindow` — show |
-| `SW_RESTORE` | `9` | `ShowWindow` — restore from minimised |
+| `SW_SHOW` | `5` | `ShowWindow` — show (unused) |
+| `SW_RESTORE` | `9` | `ShowWindow` — restore from minimised (unused) |
 
 ### Helper methods
 
@@ -79,7 +79,7 @@ to break on a client upgrade.
 | `SSL VPN-Plus Client` | Both the systray window when connected **and** the "connection established" notification popup |
 
 The last entry is ambiguous by design. `Dismiss-SVPNotification`
-([AutoVPN.ps1:698](../AutoVPN.ps1)) disambiguates by probing for an OK button
+([AutoVPN.ps1:704](../AutoVPN.ps1)) disambiguates by probing for an OK button
 (`GetDlgItem` with ID 2, then ID 1) and doing nothing when neither is present.
 
 Note also that `SSL VPN-Plus Client` is a substring of
@@ -88,7 +88,7 @@ window. The code relies on the OK-button probe to avoid acting on the wrong one.
 
 ## Control IDs
 
-Declared as constants at [AutoVPN.ps1:72](../AutoVPN.ps1). The login-window and
+Declared as constants at [AutoVPN.ps1:75](../AutoVPN.ps1). The login-window and
 systray values were determined by enumeration against SVPClient v6.3.0.
 
 The `Security Alert` and `User Authentication` values below were captured by
@@ -138,7 +138,7 @@ controls by less reliable means.
 | 1079 | `&View Certificate` |
 | 1281, 1285, 1286, 1287, 1288 | Static text describing the certificate problems |
 
-`Handle-SecurityAlert` ([AutoVPN.ps1:450](../AutoVPN.ps1)) matches on the button
+`Handle-SecurityAlert` ([AutoVPN.ps1:456](../AutoVPN.ps1)) matches on the button
 **text** `&Yes`/`Yes`, which works. Its documented fallback of
 `GetDlgItem(hwnd, 6)` (`IDYES`) is **wrong for this dialog** — the Yes button is
 1278, not 6. If the text match ever fails, the fallback fails too.
@@ -238,10 +238,10 @@ Two safe alternatives:
 ```
 
 All four click sites have been migrated: the Login button
-([AutoVPN.ps1:441](../AutoVPN.ps1)), the Security Alert Yes button
-([AutoVPN.ps1:488](../AutoVPN.ps1)), the auth OK button
-([AutoVPN.ps1:614](../AutoVPN.ps1)), and the notification dismiss
-([AutoVPN.ps1:714](../AutoVPN.ps1)). They route through `Win32::ClickHandle`,
+([AutoVPN.ps1:447](../AutoVPN.ps1)), the Security Alert Yes button
+([AutoVPN.ps1:494](../AutoVPN.ps1)), the auth OK button
+([AutoVPN.ps1:620](../AutoVPN.ps1)), and the notification dismiss
+([AutoVPN.ps1:720](../AutoVPN.ps1)). They route through `Win32::ClickHandle`,
 which posts rather than sends. `SendMessage` remains declared because the
 timeout variants share its P/Invoke block, but no PowerShell code calls it.
 

@@ -46,6 +46,9 @@ public class Win32 {
 
     // Window state
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    // ShowWindow is currently unused: the automation deliberately does not
+    // restore or raise SVPClient's windows, since BM_CLICK does not need it.
+    // Kept declared because it is the obvious tool if a future dialog ever does.
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -434,10 +437,13 @@ function Click-LoginButton {
 
     Write-Log "Clicking Login button..." "Yellow"
 
-    # Make window visible
-    [Win32]::ShowWindow($LoginWindowHwnd, [Win32]::SW_RESTORE) | Out-Null
-    Start-Sleep -Milliseconds 300
-
+    # No ShowWindow/SW_RESTORE here on purpose. BM_CLICK is delivered to the
+    # control's message queue and does not require the window to be visible,
+    # restored, or focused - verified by clicking Login on a deliberately
+    # minimized window and watching the Security Alert appear, with the
+    # foreground window unchanged. Restoring it only yanked the client in front
+    # of whatever the user was doing, and gave them a window to click on
+    # mid-sequence. See docs/04-background-service.md.
     $result = [Win32]::ClickButton($LoginWindowHwnd, [Win32]::ID_LOGIN_BTN)
     if ($result) {
         Write-Log "Login button clicked" "Green"
